@@ -1,0 +1,2097 @@
+FECHA DE EXPORTACIÓN: 2026-05-30 15:29:03
+ESTE ARCHIVO CONTIENE EL ECOSISTEMA QUANT COMPLETO.
+
+============================================================
+ 📁 ARCHIVO: 00_calibrador_matinal.py
+============================================================
+import yfinance as yf
+import pandas as pd
+import json
+import os
+import warnings
+
+warnings.simplefilter(action='ignore')
+
+ticker = "GGAL"
+print(f"⚙️ Iniciando Calibración Matinal para {ticker}...")
+parametros = {}
+
+# ==========================================
+# 1. CALIBRACIÓN INTRADIARIA (Últimos 60 días para Cajas, 2 años para MFE)
+# ==========================================
+print("📥 Descargando data intradiaria (15m y 1h)...")
+df_15m = yf.download(ticker, period="60d", interval="15m", progress=False)
+df_1h = yf.download(ticker, period="730d", interval="1h", progress=False)
+
+if isinstance(df_15m.columns, pd.MultiIndex):
+    df_15m.columns = df_15m.columns.get_level_values(0)
+    df_1h.columns = df_1h.columns.get_level_values(0)
+
+# --- A. Cajas de 15, 30, 45 y 60m ---
+df_15m.index = pd.to_datetime(df_15m.index)
+df_15m['Date'] = df_15m.index.date
+cajas_resultados = []
+
+for date, group in df_15m.groupby('Date'):
+    if len(group) < 4: continue
+    high_15, low_15 = float(group['High'].iloc[0]), float(group['Low'].iloc[0])
+    high_30, low_30 = float(group['High'].iloc[0:2].max()), float(group['Low'].iloc[0:2].min())
+    high_45, low_45 = float(group['High'].iloc[0:3].max()), float(group['Low'].iloc[0:3].min())
+    high_60, low_60 = float(group['High'].iloc[0:4].max()), float(group['Low'].iloc[0:4].min())
+    
+    cajas_resultados.append({
+        '15m': ((high_15 - low_15) / low_15) * 100,
+        '30m': ((high_30 - low_30) / low_30) * 100,
+        '45m': ((high_45 - low_45) / low_45) * 100,
+        '60m': ((high_60 - low_60) / low_60) * 100
+    })
+
+df_cajas = pd.DataFrame(cajas_resultados)
+parametros['CAJAS_INTRADIA'] = {
+    '15M': round(df_cajas['15m'].median(), 2),
+    '30M': round(df_cajas['30m'].median(), 2),
+    '45M': round(df_cajas['45m'].median(), 2),
+    '60M': round(df_cajas['60m'].median(), 2)
+}
+
+# --- B. MFE Intradiario (Amplitud Total Diaria) ---
+df_1h.index = pd.to_datetime(df_1h.index)
+df_1h['Date'] = df_1h.index.date
+mfe_intra = []
+
+for date, group in df_1h.groupby('Date'):
+    if len(group) < 3: continue
+    
+    h_dia = float(group['High'].max())
+    l_dia = float(group['Low'].min())
+    
+    # Amplitud total del día respecto a su mínimo
+    amp_total = ((h_dia - l_dia) / l_dia) * 100
+    
+    if amp_total > 0.1: 
+        mfe_intra.append(amp_total)
+
+df_mfe_intra = pd.Series(mfe_intra)
+parametros['TARGETS_INTRADIA'] = {
+    'P25': round(df_mfe_intra.quantile(0.25), 2),
+    'P50': round(df_mfe_intra.quantile(0.50), 2),
+    'P75': round(df_mfe_intra.quantile(0.75), 2)
+}
+
+# ==========================================
+# 2. CALIBRACIÓN SEMANAL (Últimos 5 Años)
+# ==========================================
+print("📥 Descargando data diaria para MFE Semanal...")
+df_d = yf.download(ticker, period="5y", interval="1d", progress=False)
+if isinstance(df_d.columns, pd.MultiIndex): df_d.columns = df_d.columns.get_level_values(0)
+
+df_d['Year'] = df_d.index.isocalendar().year
+df_d['Week'] = df_d.index.isocalendar().week
+mfe_sem = []
+cajas_sem = []
+
+for (year, week), group in df_d.groupby(['Year', 'Week']):
+    if len(group) < 3: continue
+    group = group.sort_index()
+    
+    high_d1, low_d1 = float(group['High'].iloc[0]), float(group['Low'].iloc[0])
+    cajas_sem.append(((high_d1 - low_d1) / low_d1) * 100)
+    
+    resto_sem = group.iloc[1:]
+    if resto_sem.empty: continue
+    
+    max_post, min_post = float(resto_sem['High'].max()), float(resto_sem['Low'].min())
+    
+    exp_neta = 0.0
+    if max_post > high_d1: exp_neta = max(exp_neta, ((max_post - high_d1) / high_d1) * 100)
+    if min_post < low_d1:  exp_neta = max(exp_neta, ((low_d1 - min_post) / low_d1) * 100)
+    if exp_neta > 0.5: mfe_sem.append(exp_neta)
+
+df_mfe_sem = pd.Series(mfe_sem)
+parametros['CAJA_SEMANAL_DIA1'] = round(pd.Series(cajas_sem).median(), 2)
+parametros['TARGETS_SEMANALES'] = {
+    'P25': round(df_mfe_sem.quantile(0.25), 2),
+    'P50': round(df_mfe_sem.quantile(0.50), 2),
+    'P75': round(df_mfe_sem.quantile(0.75), 2)
+}
+
+# ==========================================
+# 3. EXPORTACIÓN A JSON
+# ==========================================
+ruta_json = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parametros_ggal.json")
+with open(ruta_json, "w") as f:
+    json.dump(parametros, f, indent=4)
+
+print(f"✅ ¡Calibración exitosa! Parámetros guardados en: parametros_ggal.json")
+for k, v in parametros.items():
+    print(f"  - {k}: {v}")
+
+============================================================
+ 📁 ARCHIVO: 01_master_semanal.py
+============================================================
+import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import warnings
+import os
+from datetime import datetime
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+ticker = "GGAL"
+print(f"🔄 Procesando Reporte Cuantitativo Semanal ({ticker}) - Base 1 Año...")
+
+# ==========================================
+# 📥 DESCARGA DE DATOS
+# ==========================================
+df_d = yf.download(ticker, period="5y", interval="1d", progress=False)
+df_w = yf.download(ticker, period="5y", interval="1wk", progress=False)
+
+for df in [df_d, df_w]:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+# ==========================================
+# 📊 MÓDULO 1: MACRO VOLATILIDAD
+# ==========================================
+df_w['Spread_%'] = ((df_w['High'] - df_w['Low']) / df_w['Low']) * 100
+df_w_limpio = df_w[(df_w['Spread_%'] > 0) & (df_w['Spread_%'] <= 60.0)].copy()
+
+df_w_limpio['P50_Rodante'] = df_w_limpio['Spread_%'].rolling(window=13).quantile(0.50)
+df_w_limpio['Tendencia_P50'] = df_w_limpio['P50_Rodante'].rolling(window=4).mean()
+df_w_rodante = df_w_limpio.dropna(subset=['Tendencia_P50'])
+
+df_w_plot = df_w_rodante.iloc[-52:]
+
+m1_p50 = df_w_plot['P50_Rodante'].iloc[-1]
+m1_tendencia = df_w_plot['Tendencia_P50'].iloc[-1]
+m1_estado = "EXPANSIÓN 📈" if m1_p50 > m1_tendencia else "CONTRACCIÓN 📉"
+
+# ==========================================
+# 🎯 MÓDULO 2: PODER PREDICTIVO (DÍA 1)
+# ==========================================
+df_d['Year'] = df_d.index.isocalendar().year
+df_d['Week'] = df_d.index.isocalendar().week
+
+m2_resultados = []
+for (year, week), group in df_d.groupby(['Year', 'Week']):
+    if len(group) < 3: continue
+    group = group.sort_index()
+    
+    dia1_open, dia1_close = float(group['Open'].iloc[0]), float(group['Close'].iloc[0])
+    sem_close = float(group['Close'].iloc[-1])
+    
+    if dia1_open == dia1_close or dia1_open == sem_close: continue
+    
+    dia1_alcista = dia1_close > dia1_open
+    sem_alcista = sem_close > dia1_open
+    
+    m2_resultados.append({
+        'Fecha': group.index[-1],
+        'Dia1_Alcista': dia1_alcista,
+        'Acierto': 1 if (dia1_alcista == sem_alcista) else 0
+    })
+
+df_m2 = pd.DataFrame(m2_resultados)
+df_m2_ult_anio = df_m2.iloc[-52:] 
+
+hit_rate_gral = (df_m2_ult_anio['Acierto'].sum() / len(df_m2_ult_anio)) * 100
+dias_verdes = df_m2_ult_anio[df_m2_ult_anio['Dia1_Alcista'] == True]
+dias_rojos = df_m2_ult_anio[df_m2_ult_anio['Dia1_Alcista'] == False]
+
+hr_verde = (dias_verdes['Acierto'].sum() / len(dias_verdes)) * 100 if len(dias_verdes)>0 else 0
+hr_rojo = (dias_rojos['Acierto'].sum() / len(dias_rojos)) * 100 if len(dias_rojos)>0 else 0
+
+ultimo_dia1_alcista = df_m2['Dia1_Alcista'].iloc[-1]
+sesgo_actual = "ALCISTA 🟩" if ultimo_dia1_alcista else "BAJISTA 🟥"
+prob_acierto = hr_verde if ultimo_dia1_alcista else hr_rojo
+
+# ==========================================
+# 📦 MÓDULO 3: RIESGO Y TARGETS MFE
+# ==========================================
+m3_riesgos, m3_mfe_datos = [], []
+
+for (year, week), group in df_d.groupby(['Year', 'Week']):
+    if len(group) < 3: continue
+    group = group.sort_index()
+    
+    high_d1, low_d1 = float(group['High'].iloc[0]), float(group['Low'].iloc[0])
+    m3_riesgos.append(((high_d1 - low_d1) / low_d1) * 100)
+    
+    resto_semana = group.iloc[1:]
+    if resto_semana.empty: continue
+    
+    max_post, min_post = float(resto_semana['High'].max()), float(resto_semana['Low'].min())
+    
+    exp_neta = 0.0
+    if max_post > high_d1: exp_neta = max(exp_neta, ((max_post - high_d1) / high_d1) * 100)
+    if min_post < low_d1:  exp_neta = max(exp_neta, ((low_d1 - min_post) / low_d1) * 100)
+    
+    if exp_neta > 0.5: 
+        m3_mfe_datos.append({'Fecha': group.index[-1], 'Expansion': exp_neta})
+
+df_mfe = pd.DataFrame(m3_mfe_datos).set_index('Fecha')
+df_mfe['P50_Rodante'] = df_mfe['Expansion'].rolling(window=26).quantile(0.50)
+df_mfe['P75_Rodante'] = df_mfe['Expansion'].rolling(window=26).quantile(0.75)
+df_mfe['Tendencia_MFE'] = df_mfe['P50_Rodante'].rolling(window=8).mean()
+
+df_mfe_rodante = df_mfe.dropna(subset=['Tendencia_MFE'])
+df_mfe_plot = df_mfe_rodante.iloc[-52:]
+
+riesgo_mediano = pd.Series(m3_riesgos[-52:]).median()
+tp1_p50 = df_mfe_plot['P50_Rodante'].iloc[-1]
+tp2_p75 = df_mfe_plot['P75_Rodante'].iloc[-1]
+mfe_trend = df_mfe_plot['Tendencia_MFE'].iloc[-1]
+
+estado_mfe = "AMPLIÁNDOSE 🚀" if tp1_p50 > mfe_trend else "ACHICÁNDOSE ⚠️"
+
+# ==========================================
+# 🖨️ RENDERIZADO DEL REPORTE EJECUTIVO
+# ==========================================
+print("\n" + "="*60)
+print(f" 📑 INFORME CUANTITATIVO SEMANAL - {ticker} ADR")
+print("="*60)
+
+print("\n🌍 1. CONTEXTO MACRO (Últimas 52 Semanas)")
+print("-" * 60)
+print(f"Régimen Actual:       {m1_estado}")
+print(f"Amplitud Mediana:     {m1_p50:.2f}% por semana")
+print(f"Tendencia (SMA 4w):   {m1_tendencia:.2f}%")
+
+print("\n🔮 2. SESGO DIRECCIONAL (Inercia del Día 1)")
+print("-" * 60)
+print(f"Dirección Marcada:    {sesgo_actual}")
+print(f"Hit Rate Base 1 Año:  {hit_rate_gral:.1f}% de confiabilidad")
+print(f"Prob. Específica:     {prob_acierto:.1f}% (Basado en Día 1 {sesgo_actual.split()[0]})")
+
+print("\n🎯 3. HOJA DE RUTA OPERATIVA (Riesgo / Beneficio)")
+print("-" * 60)
+print(f"Stop Loss Estructural:{riesgo_mediano:.2f}% (Piso/Techo Mediano de la Caja)")
+print(f"Target 1 (TP1 - P50): {tp1_p50:.2f}% limpio desde quiebre")
+print(f"Target 2 (TP2 - P75): {tp2_p75:.2f}% limpio desde quiebre")
+print(f"Momento MFE:          {estado_mfe}")
+
+print("\n" + "="*60)
+print(" 🧠 CONCLUSIONES Y LECTURA OPERATIVA")
+print("="*60)
+if m1_p50 > m1_tendencia:
+    print(f"[*] VOLATILIDAD: Mercado despertando. Comprar opciones outright o armar Spreads direccionales agresivos tiene ventaja matemática.")
+else:
+    print(f"[*] VOLATILIDAD: Entorno contractivo. El factor Theta castiga. Priorizar armado de Spreads ajustados o estrategias de cobro.")
+
+print(f"[*] DIRECCIÓN: El flujo del Lunes dicta posicionamiento {sesgo_actual.split()[0]} con una ventaja del {prob_acierto:.1f}%.")
+print(f"[*] ESTRUCTURACIÓN: Si operás Spreads (ej. Bull {sesgo_actual.split()[0]}), buscá que la base vendida caiga a {tp1_p50:.2f}% del precio de quiebre para asegurar el cobro en la zona de mayor confluencia estadística.")
+print("="*60 + "\n")
+
+# ==========================================
+# 📊 RENDERIZADO VISUAL (DASHBOARD 2x2)
+# ==========================================
+plt.style.use('dark_background')
+fig = plt.figure(figsize=(16, 10))
+gs = gridspec.GridSpec(2, 2, height_ratios=[1, 1], wspace=0.2, hspace=0.3)
+fig.suptitle(f'Dashboard Cuantitativo Semanal - {ticker} ADR (Últimas 52 Semanas)', fontsize=16, fontweight='bold', y=0.98)
+
+# --- PANEL 1 ---
+ax1 = plt.subplot(gs[0, 0])
+ax1.plot(df_w_plot.index, df_w_plot['P50_Rodante'], color='yellow', linewidth=2.5, label='P50 (Mediana)')
+ax1.plot(df_w_plot.index, df_w_plot['Tendencia_P50'], color='white', linestyle='--', linewidth=1.5, label='Tendencia (4w)')
+ax1.fill_between(df_w_plot.index, df_w_plot['P50_Rodante'], df_w_plot['Tendencia_P50'], 
+                 where=(df_w_plot['P50_Rodante'] >= df_w_plot['Tendencia_P50']), color='mediumseagreen', alpha=0.4, label='Expansión')
+ax1.fill_between(df_w_plot.index, df_w_plot['P50_Rodante'], df_w_plot['Tendencia_P50'], 
+                 where=(df_w_plot['P50_Rodante'] < df_w_plot['Tendencia_P50']), color='crimson', alpha=0.4, label='Contracción')
+ax1.set_title('Régimen de Volatilidad (Módulo 1)', fontsize=12, fontweight='bold')
+ax1.set_ylabel('Spread (%)')
+ax1.legend(loc='upper right', fontsize=9)
+ax1.grid(True, linestyle=':', alpha=0.4)
+
+# --- PANEL 2 ---
+ax2 = plt.subplot(gs[0, 1])
+ax2.plot(df_mfe_plot.index, df_mfe_plot['P75_Rodante'], color='orange', linewidth=1.5, label='TP2 (P75)')
+ax2.plot(df_mfe_plot.index, df_mfe_plot['P50_Rodante'], color='yellow', linewidth=2.5, label='TP1 (P50)')
+ax2.plot(df_mfe_plot.index, df_mfe_plot['Tendencia_MFE'], color='white', linestyle='--', linewidth=1.5, label='Tendencia MFE')
+ax2.fill_between(df_mfe_plot.index, df_mfe_plot['P50_Rodante'], df_mfe_plot['Tendencia_MFE'], 
+                 where=(df_mfe_plot['P50_Rodante'] >= df_mfe_plot['Tendencia_MFE']), color='mediumseagreen', alpha=0.4)
+ax2.fill_between(df_mfe_plot.index, df_mfe_plot['P50_Rodante'], df_mfe_plot['Tendencia_MFE'], 
+                 where=(df_mfe_plot['P50_Rodante'] < df_mfe_plot['Tendencia_MFE']), color='crimson', alpha=0.4)
+ax2.set_title('Recorrido Neto Post-Quiebre (Módulo 3)', fontsize=12, fontweight='bold')
+ax2.set_ylabel('Expansión Neta (%)')
+ax2.legend(loc='upper right', fontsize=9)
+ax2.grid(True, linestyle=':', alpha=0.4)
+
+# --- PANEL 3 ---
+ax3 = plt.subplot(gs[1, 0])
+labels = [f'Predice Semana\n({hit_rate_gral:.1f}%)', f'Falso Quiebre\n({100-hit_rate_gral:.1f}%)']
+sizes = [df_m2_ult_anio['Acierto'].sum(), len(df_m2_ult_anio) - df_m2_ult_anio['Acierto'].sum()]
+colors = ['dodgerblue', 'crimson']
+ax3.pie(sizes, explode=(0.05, 0), labels=labels, colors=colors, autopct='%1.1f%%', startangle=90, textprops={'fontsize': 11, 'fontweight': 'bold'})
+ax3.set_title(f'Poder Predictivo General (Día 1)', fontsize=12, fontweight='bold')
+
+# --- PANEL 4 ---
+ax4 = plt.subplot(gs[1, 1])
+barras = ['Si Día 1 es VERDE', 'Si Día 1 es ROJO']
+valores = [hr_verde, hr_rojo]
+colores_barras = ['mediumseagreen', 'salmon']
+ax4.bar(barras, valores, color=colores_barras, edgecolor='white', alpha=0.9, width=0.5)
+ax4.axhline(y=50, color='white', linestyle='--', alpha=0.5)
+for i, v in enumerate(valores):
+    ax4.text(i, v + 2, f"{v:.1f}%", ha='center', fontweight='bold', fontsize=11)
+ax4.set_title('Probabilidad de Acertar por Sesgo', fontsize=12, fontweight='bold')
+ax4.set_ylabel('Probabilidad (%)')
+ax4.set_ylim(0, 100)
+
+plt.tight_layout()
+
+# ==========================================
+# 💾 EXPORTACIÓN GRÁFICA ESTÁTICA
+# ==========================================
+carpeta_actual = os.path.dirname(os.path.abspath(__file__))
+nombre_archivo = os.path.join(carpeta_actual, f"GRAFICO_SEMANAL_{datetime.now().strftime('%H%M%S')}.png")
+
+plt.savefig(nombre_archivo, dpi=100)
+plt.close(fig) 
+os.startfile(nombre_archivo)
+
+============================================================
+ 📁 ARCHIVO: 02_master_intradiario.py
+============================================================
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import warnings
+import os
+from datetime import datetime
+
+warnings.simplefilter(action='ignore')
+
+ticker = "GGAL"
+print(f"🔄 Procesando Reporte Cuantitativo INTRADIARIO ({ticker})")
+print("📥 Descargando historiales de alta frecuencia (15m y 1h)...")
+
+# ==========================================
+# 1. DESCARGA Y LIMPIEZA CENTRALIZADA
+# ==========================================
+# Descargamos 60 días para el micro-régimen y 730 días para el histórico
+df_15m = yf.download(ticker, period="60d", interval="15m", progress=False)
+df_1h = yf.download(ticker, period="730d", interval="1h", progress=False)
+
+for df in [df_15m, df_1h]:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.index = pd.to_datetime(df.index)
+
+# Ajuste horario ARG
+df_1h.index = df_1h.index.tz_convert('America/Argentina/Buenos_Aires')
+df_1h['Hora_ARG'] = df_1h.index.strftime('%H:00')
+df_1h['Date'] = df_1h.index.date
+df_1h = df_1h[(df_1h['Hora_ARG'] >= '10:00') & (df_1h['Hora_ARG'] <= '18:00')].copy()
+
+df_15m['Date'] = df_15m.index.date
+
+# ==========================================
+# 2. PROCESAMIENTO MICRO-RÉGIMEN (15m a 60m)
+# ==========================================
+res_micro = []
+for date, group in df_15m.groupby('Date'):
+    if len(group) < 4: continue
+    
+    h15, l15 = float(group['High'].iloc[0]), float(group['Low'].iloc[0])
+    h30, l30 = float(group['High'].iloc[0:2].max()), float(group['Low'].iloc[0:2].min())
+    h45, l45 = float(group['High'].iloc[0:3].max()), float(group['Low'].iloc[0:3].min())
+    h60, l60 = float(group['High'].iloc[0:4].max()), float(group['Low'].iloc[0:4].min())
+    
+    res_micro.append({
+        '15m': ((h15 - l15) / l15) * 100,
+        '30m': ((h30 - l30) / l30) * 100,
+        '45m': ((h45 - l45) / l45) * 100,
+        '60m': ((h60 - l60) / l60) * 100
+    })
+df_micro = pd.DataFrame(res_micro)
+
+# ==========================================
+# 3. PROCESAMIENTO MACRO-INTRADIARIO (1h)
+# ==========================================
+res_intra = []
+for date, group in df_1h.groupby('Date'):
+    if len(group) < 4: continue
+    
+    # Datos Caja Inicial
+    vela_1 = group.iloc[0]
+    h_caja, l_caja = float(vela_1['High']), float(vela_1['Low'])
+    spread_caja = ((h_caja - l_caja) / l_caja) * 100
+    
+    # Datos Día Completo
+    h_dia, l_dia = float(group['High'].max()), float(group['Low'].min())
+    spread_dia = ((h_dia - l_dia) / l_dia) * 100
+    
+    # Datos MFE (Post-60m)
+    resto_dia = group.iloc[1:]
+    mfe_neta = 0.0
+    if not resto_dia.empty:
+        max_post, min_post = float(resto_dia['High'].max()), float(resto_dia['Low'].min())
+        if max_post > h_caja: mfe_neta = max(mfe_neta, ((max_post - h_caja) / h_caja) * 100)
+        if min_post < l_caja: mfe_neta = max(mfe_neta, ((l_caja - min_post) / l_caja) * 100)
+        
+    res_intra.append({
+        'Fecha': pd.to_datetime(date),
+        'Caja_60m': spread_caja,
+        'Spread_Dia': spread_dia,
+        'MFE': mfe_neta if mfe_neta > 0.1 else np.nan
+    })
+
+df_intra = pd.DataFrame(res_intra).set_index('Fecha')
+
+# --- Cálculos Móviles (Rolling) ---
+# Rolling Cajas (60 días)
+df_intra['Caja_P25'] = df_intra['Caja_60m'].rolling(window=60).quantile(0.25)
+df_intra['Caja_P50'] = df_intra['Caja_60m'].rolling(window=60).quantile(0.50)
+df_intra['Caja_P75'] = df_intra['Caja_60m'].rolling(window=60).quantile(0.75)
+
+# Rolling MFE (40 días)
+df_mfe = df_intra.dropna(subset=['MFE']).copy()
+df_mfe['MFE_P50'] = df_mfe['MFE'].rolling(window=40).quantile(0.50)
+df_mfe['MFE_P75'] = df_mfe['MFE'].rolling(window=40).quantile(0.75)
+df_mfe['MFE_Trend'] = df_mfe['MFE_P50'].rolling(window=15).mean()
+
+# --- Estadística Caja vs Amplitud ---
+mediana_historica_caja = df_intra['Caja_60m'].median()
+df_intra['Tipo_Caja'] = np.where(df_intra['Caja_60m'] <= mediana_historica_caja, 'Angosta', 'Amplia')
+correlacion = df_intra['Caja_60m'].corr(df_intra['Spread_Dia'])
+
+# ==========================================
+# 4. EXTRACCIÓN DE DATOS DE HOY
+# ==========================================
+caja_hoy = df_intra['Caja_60m'].iloc[-1]
+p25_caja, p50_caja, p75_caja = df_intra['Caja_P25'].iloc[-1], df_intra['Caja_P50'].iloc[-1], df_intra['Caja_P75'].iloc[-1]
+
+if caja_hoy > p75_caja: estado_caja = "EXTREMA (Fase Expansiva P75+)"
+elif caja_hoy > p50_caja: estado_caja = "AMPLIA (Por encima del promedio)"
+elif caja_hoy < p25_caja: estado_caja = "MOMIA (Fase Contractiva P25-)"
+else: estado_caja = "ANGOSTA (Por debajo del promedio)"
+
+tp1_mfe, tp2_mfe, trend_mfe = df_mfe['MFE_P50'].iloc[-1], df_mfe['MFE_P75'].iloc[-1], df_mfe['MFE_Trend'].iloc[-1]
+
+# ==========================================
+# 🖨️ REPORTE EJECUTIVO EN CONSOLA
+# ==========================================
+print("\n" + "="*60)
+print(f" 📑 INFORME CUANTITATIVO INTRADIARIO - {ticker} ADR")
+print("="*60)
+
+print("\n🕒 1. MICRO-RÉGIMEN DE APERTURA (Riesgo inicial 60d)")
+print("-" * 60)
+print(f"Mediana 15m (Riesgo Base):   {df_micro['15m'].median():.2f}%")
+print(f"Mediana 30m (Confirmación):  {df_micro['30m'].median():.2f}%")
+print(f"Mediana 60m (Caja Total):    {df_micro['60m'].median():.2f}%")
+
+print("\n🎯 2. RÉGIMEN ACTUAL DE LA PRIMERA HORA (60m)")
+print("-" * 60)
+print(f"Amplitud Hoy:         {caja_hoy:.2f}%")
+print(f"Estado del Mercado:   {estado_caja}")
+print(f"Umbral de Locura(P75): > {p75_caja:.2f}%")
+
+print("\n🚀 3. TARGETS DE EXPANSIÓN (MFE Post-Quiebre)")
+print("-" * 60)
+print(f"TP1 (Probable - P50): {tp1_mfe:.2f}% limpio desde la ruptura")
+print(f"TP2 (Extremo - P75):  {tp2_mfe:.2f}% limpio desde la ruptura")
+momentum_mfe = "CRECIENDO 📈" if tp1_mfe > trend_mfe else "ACHICÁNDOSE 📉"
+print(f"Momentum de Targets:  {momentum_mfe}")
+
+print("\n📊 4. IMPACTO DEL TAMAÑO DE CAJA (Efecto Contagio)")
+print("-" * 60)
+if correlacion > 0.5:
+    print(f"Fuerte Correlación ({correlacion:.2f}): El tamaño de la apertura SÍ dicta")
+    print("el ritmo. Aperturas violentas garantizan días violentos.")
+else:
+    print(f"Correlación Débil ({correlacion:.2f}): El mercado es errático. Puede")
+    print("dormir en la apertura y explotar después (o viceversa).")
+print("="*60 + "\n")
+
+# ==========================================
+# 📊 RENDERIZADO VISUAL (DASHBOARD 2x2)
+# ==========================================
+plt.style.use('dark_background')
+fig = plt.figure(figsize=(16, 11))
+gs = gridspec.GridSpec(2, 2, height_ratios=[1.2, 1], wspace=0.2, hspace=0.3)
+fig.suptitle(f'Dashboard Intradiario de Alta Frecuencia - {ticker} ADR', fontsize=16, fontweight='bold', y=0.98)
+
+# --- PANEL 1: ROLLING CAJAS 60m (Arriba Izquierda) ---
+ax1 = plt.subplot(gs[0, 0])
+df_plot_1 = df_intra.dropna(subset=['Caja_P50']).iloc[-100:] # Últimos 100 días
+ax1.plot(df_plot_1.index, df_plot_1['Caja_P75'], color='orange', alpha=0.6, label='P75 (Techo)')
+ax1.plot(df_plot_1.index, df_plot_1['Caja_P50'], color='yellow', linewidth=2, label='P50 (Mediana)')
+ax1.plot(df_plot_1.index, df_plot_1['Caja_P25'], color='gray', alpha=0.6, label='P25 (Piso)')
+ax1.fill_between(df_plot_1.index, df_plot_1['Caja_P50'], df_plot_1['Caja_P75'], color='mediumseagreen', alpha=0.2)
+ax1.fill_between(df_plot_1.index, df_plot_1['Caja_P25'], df_plot_1['Caja_P50'], color='crimson', alpha=0.2)
+ax1.scatter(df_plot_1.index, df_plot_1['Caja_60m'], color='dodgerblue', alpha=0.6, s=20)
+ax1.scatter(df_plot_1.index[-1], caja_hoy, color='lime', s=100, edgecolors='white', zorder=5) # Punto de hoy
+ax1.set_title('Evolución de Cajas Iniciales (Rolling 60d)', fontsize=12, fontweight='bold')
+ax1.set_ylabel('Amplitud 1ra Hora (%)')
+ax1.legend(loc='upper left', fontsize=9)
+ax1.grid(True, linestyle=':', alpha=0.3)
+
+# --- PANEL 2: ROLLING MFE TARGETS (Arriba Derecha) ---
+ax2 = plt.subplot(gs[0, 1])
+df_plot_2 = df_mfe.dropna(subset=['MFE_Trend']).iloc[-100:]
+ax2.plot(df_plot_2.index, df_plot_2['MFE_P75'], color='orange', linewidth=1.5, label='TP2 (P75)')
+ax2.plot(df_plot_2.index, df_plot_2['MFE_P50'], color='yellow', linewidth=2.5, label='TP1 (P50)')
+ax2.plot(df_plot_2.index, df_plot_2['MFE_Trend'], color='white', linestyle='--', linewidth=1.5, label='Tendencia SMA')
+ax2.fill_between(df_plot_2.index, df_plot_2['MFE_P50'], df_plot_2['MFE_Trend'], 
+                 where=(df_plot_2['MFE_P50'] >= df_plot_2['MFE_Trend']), color='mediumseagreen', alpha=0.4)
+ax2.fill_between(df_plot_2.index, df_plot_2['MFE_P50'], df_plot_2['MFE_Trend'], 
+                 where=(df_plot_2['MFE_P50'] < df_plot_2['MFE_Trend']), color='crimson', alpha=0.4)
+ax2.set_title('Recorrido Limpio Intradiario Post-Quiebre (MFE)', fontsize=12, fontweight='bold')
+ax2.set_ylabel('Expansión Neta (%)')
+ax2.legend(loc='upper right', fontsize=9)
+ax2.grid(True, linestyle=':', alpha=0.3)
+
+# --- PANEL 3: MICRO-RÉGIMEN BOXPLOT (Abajo Izquierda) ---
+ax3 = plt.subplot(gs[1, 0])
+bplot3 = ax3.boxplot([df_micro['15m'], df_micro['30m'], df_micro['45m'], df_micro['60m']], 
+                     patch_artist=True, tick_labels=['15m', '30m', '45m', '60m'])
+colors3 = ['dodgerblue', 'orange', 'mediumseagreen', 'crimson']
+for patch, color in zip(bplot3['boxes'], colors3):
+    patch.set_facecolor(color)
+    patch.set_alpha(0.7)
+for median in bplot3['medians']: median.set(color='white', linewidth=2)
+ax3.set_title('Expansión de la Caja en la Primera Hora (Últimos 60d)', fontsize=12, fontweight='bold')
+ax3.set_ylabel('Amplitud (%)')
+ax3.grid(axis='y', linestyle='--', alpha=0.3)
+
+# --- PANEL 4: DISPERSIÓN CAJA VS DÍA (Abajo Derecha) ---
+ax4 = plt.subplot(gs[1, 1])
+ax4.scatter(df_intra['Caja_60m'], df_intra['Spread_Dia'], color='dodgerblue', alpha=0.6, edgecolors='w')
+ax4.axvline(mediana_historica_caja, color='white', linestyle='--', linewidth=2, label=f'Mediana ({mediana_historica_caja:.2f}%)')
+m, b = np.polyfit(df_intra['Caja_60m'], df_intra['Spread_Dia'], 1)
+ax4.plot(df_intra['Caja_60m'], m*df_intra['Caja_60m'] + b, color='orange', linewidth=2, linestyle=':', label='Tendencia')
+ax4.set_title(f'Impacto de la Apertura en la Rueda (Correlación: {correlacion:.2f})', fontsize=12, fontweight='bold')
+ax4.set_xlabel('Amplitud Caja 60m (%)')
+ax4.set_ylabel('Amplitud Total Día (%)')
+ax4.grid(True, linestyle=':', alpha=0.3)
+ax4.legend(fontsize=9)
+
+plt.tight_layout()
+
+# ==========================================
+# 💾 EXPORTACIÓN GRÁFICA ESTÁTICA
+# ==========================================
+carpeta_actual = os.path.dirname(os.path.abspath(__file__))
+nombre_archivo = os.path.join(carpeta_actual, f"GRAFICO_INTRADIA_{datetime.now().strftime('%H%M%S')}.png")
+
+plt.savefig(nombre_archivo, dpi=100)
+plt.close(fig) 
+os.startfile(nombre_archivo)
+
+============================================================
+ 📁 ARCHIVO: 03_master_cierres.py
+============================================================
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as patches
+import matplotlib.colors as mcolors
+import warnings
+import os
+from datetime import datetime
+
+warnings.simplefilter(action='ignore')
+
+ticker = "GGAL"
+print(f"🔄 Procesando Master de Cierres y Mapa Compuesto ({ticker})...")
+
+# ==========================================
+# 1. DESCARGA CENTRALIZADA
+# ==========================================
+print("📥 Descargando historiales diarios y semanales (Últimos 5 años)...")
+df_d = yf.download(ticker, period="5y", interval="1d", progress=False)
+df_w = yf.download(ticker, period="5y", interval="1wk", progress=False)
+
+for df in [df_d, df_w]:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+# Filtramos velas válidas
+df_d = df_d[df_d['High'] > df_d['Low']].copy()
+df_w = df_w[df_w['High'] > df_w['Low']].copy()
+
+# ==========================================
+# 2. CÁLCULO DE CLOSE LOCATION VALUE (CLV)
+# ==========================================
+df_d['CLV_%'] = ((df_d['Close'] - df_d['Low']) / (df_d['High'] - df_d['Low'])) * 100
+df_w['CLV_%'] = ((df_w['Close'] - df_w['Low']) / (df_w['High'] - df_w['Low'])) * 100
+
+bins = [0, 20, 40, 60, 80, 100]
+etiquetas = [
+    "1. Extremo Inf\n(0-20%)", 
+    "2. Medio-Bajo\n(20-40%)", 
+    "3. Neutral\n(40-60%)", 
+    "4. Medio-Alto\n(60-80%)", 
+    "5. Extremo Sup\n(80-100%)"
+]
+
+df_d['Zona_CLV'] = pd.cut(df_d['CLV_%'], bins=bins, labels=etiquetas, include_lowest=True)
+df_w['Zona_CLV'] = pd.cut(df_w['CLV_%'], bins=bins, labels=etiquetas, include_lowest=True)
+
+prob_diaria = (df_d['Zona_CLV'].value_counts(normalize=True).sort_index() * 100)
+prob_semanal = (df_w['Zona_CLV'].value_counts(normalize=True).sort_index() * 100)
+
+# ==========================================
+# 3. PREPARACIÓN DEL HEATMAP COMPUESTO
+# ==========================================
+df_bull = df_w[df_w['Close'] >= df_w['Open']].copy()
+df_bull['MFE_%'] = ((df_bull['High'] - df_bull['Low']) / df_bull['Low']) * 100
+
+mfe_p25 = df_bull['MFE_%'].quantile(0.25)
+mfe_p50 = df_bull['MFE_%'].quantile(0.50)
+mfe_p75 = df_bull['MFE_%'].quantile(0.75)
+mfe_p90 = df_bull['MFE_%'].quantile(0.90)
+
+# Re-calculamos prob CLV solo para semanas Bull
+df_bull['Zona_CLV_num'] = pd.cut(df_bull['CLV_%'], bins=bins, include_lowest=True)
+prob_clv_bull = (df_bull['Zona_CLV_num'].value_counts(normalize=True).sort_index() * 100).values
+
+spot = float(df_d['Close'].iloc[-1])
+
+# Extraer caja del Día 1 de la semana actual
+df_d['Year'] = df_d.index.isocalendar().year
+df_d['Week'] = df_d.index.isocalendar().week
+current_year = df_d['Year'].iloc[-1]
+current_week = df_d['Week'].iloc[-1]
+
+df_current_week = df_d[(df_d['Year'] == current_year) & (df_d['Week'] == current_week)]
+
+if not df_current_week.empty:
+    d1_high, d1_low = float(df_current_week['High'].iloc[0]), float(df_current_week['Low'].iloc[0])
+    d1_open, d1_close = float(df_current_week['Open'].iloc[0]), float(df_current_week['Close'].iloc[0])
+else:
+    d1_high, d1_low, d1_open, d1_close = spot*1.01, spot*0.99, spot, spot
+
+# ==========================================
+# 4. IMPRESIÓN EN CONSOLA (CLV)
+# ==========================================
+print("\n" + "="*55)
+print(f" 🎯 PROBABILIDADES DE ZONA DE CIERRE (CLV) - {ticker}")
+print("="*55)
+print("📊 DISTRIBUCIÓN DIARIA (Dónde cierra el día):")
+for zona, prob in prob_diaria.items():
+    print(f"   - {str(zona).replace(chr(10), ' ')}: {prob:.2f}%")
+
+print("-" * 55)
+print("📅 DISTRIBUCIÓN SEMANAL (Dónde cierra el Viernes):")
+for zona, prob in prob_semanal.items():
+    print(f"   - {str(zona).replace(chr(10), ' ')}: {prob:.2f}%")
+print("="*55)
+
+# ==========================================
+# 5. RENDERIZADO DEL DASHBOARD (2x2 Grid)
+# ==========================================
+plt.style.use('dark_background')
+fig = plt.figure(figsize=(16, 12))
+gs = gridspec.GridSpec(2, 2, height_ratios=[1, 1.5], wspace=0.2, hspace=0.3)
+fig.suptitle(f'Master de Cierres y Probabilidad Compuesta (GGAL ADR)', fontsize=16, fontweight='bold', y=0.97)
+
+colores_clv = ['crimson', 'salmon', 'gray', 'mediumseagreen', 'lime']
+
+# --- PANEL 1: CLV DIARIO (Arriba Izquierda) ---
+ax1 = plt.subplot(gs[0, 0])
+barras_d = ax1.bar(prob_diaria.index, prob_diaria.values, color=colores_clv, alpha=0.8, edgecolor='white')
+ax1.set_title('Comportamiento DIARIO (Vela 1D)', fontsize=12, fontweight='bold')
+ax1.set_ylabel('Probabilidad Histórica (%)')
+ax1.tick_params(axis='x', rotation=0, labelsize=9)
+ax1.grid(axis='y', linestyle=':', alpha=0.4)
+for bar in barras_d:
+    yval = bar.get_height()
+    ax1.text(bar.get_x() + bar.get_width()/2, yval + 0.5, f"{yval:.1f}%", ha='center', fontweight='bold', fontsize=9)
+
+# --- PANEL 2: CLV SEMANAL (Arriba Derecha) ---
+ax2 = plt.subplot(gs[0, 1])
+barras_w = ax2.bar(prob_semanal.index, prob_semanal.values, color=colores_clv, alpha=0.8, edgecolor='white')
+ax2.set_title('Comportamiento SEMANAL (Vela 1W)', fontsize=12, fontweight='bold')
+ax2.tick_params(axis='x', rotation=0, labelsize=9)
+ax2.grid(axis='y', linestyle=':', alpha=0.4)
+for bar in barras_w:
+    yval = bar.get_height()
+    ax2.text(bar.get_x() + bar.get_width()/2, yval + 0.5, f"{yval:.1f}%", ha='center', fontweight='bold', fontsize=9)
+
+# --- PANEL 3: HEATMAP DE CONFLUENCIA (Abajo Ocupando 2 Columnas) ---
+ax3 = plt.subplot(gs[1, :])
+
+# Dibujar caja Día 1
+ax3.plot([0, 0], [d1_low, d1_high], color='white', linewidth=2) 
+color_caja = 'mediumseagreen' if d1_close >= d1_open else 'crimson'
+rect_d1 = patches.Rectangle((-0.2, min(d1_open, d1_close)), 0.4, abs(d1_close - d1_open), 
+                            facecolor=color_caja, edgecolor='white', linewidth=1.5)
+ax3.add_patch(rect_d1)
+ax3.text(0, d1_low - (spot*0.01), "Caja Día 1\n(Riesgo)", ha='center', va='top', color='white', fontsize=10)
+
+ax3.axhline(spot, color='dodgerblue', linestyle='-.', linewidth=1.5, label=f"Spot Actual: ${spot:.2f}")
+ax3.axhline(d1_high, color='gray', linestyle=':', linewidth=1)
+
+scenarios = [
+    {'name': 'P25 (Corto)', 'mfe': mfe_p25, 'prob_reach': 75, 'x': 2},
+    {'name': 'P50 (Medio)', 'mfe': mfe_p50, 'prob_reach': 50, 'x': 4},
+    {'name': 'P75 (Óptimo)', 'mfe': mfe_p75, 'prob_reach': 25, 'x': 6},
+    {'name': 'P90 (Extremo)', 'mfe': mfe_p90, 'prob_reach': 10, 'x': 8}
+]
+
+max_y_plot = spot 
+bloques = []
+
+for esc in scenarios:
+    techo = d1_high * (1 + esc['mfe']/100)
+    rango = techo - d1_high
+    max_y_plot = max(max_y_plot, techo)
+    ax3.text(esc['x'] + 0.5, techo + (spot*0.01), f"{esc['name']}\nLlegar: {esc['prob_reach']}%",
+            ha='center', va='bottom', color='white', fontweight='bold', fontsize=10)
+    
+    for j in range(5):
+        piso_z = d1_high + (j * rango / 5)
+        alto_z = rango / 5
+        p_clv = prob_clv_bull[j]
+        score = (esc['prob_reach'] / 100) * (p_clv / 100) * 100
+        
+        bloques.append({
+            'x': esc['x'], 'piso_z': piso_z, 'alto_z': alto_z,
+            'p_clv': p_clv, 'score': score
+        })
+
+scores_list = [b['score'] for b in bloques]
+min_score, max_score = min(scores_list), max(scores_list)
+cmap = mcolors.LinearSegmentedColormap.from_list("escala_score", ['#8b0000', '#cd5c5c', '#808080', '#3cb371', '#00ff00'])
+norm = mcolors.Normalize(vmin=min_score, vmax=max_score)
+
+for b in bloques:
+    color_bloque = cmap(norm(b['score']))
+    rect = patches.Rectangle((b['x'], b['piso_z']), 1, b['alto_z'], 
+                             linewidth=1, edgecolor='black', facecolor=color_bloque, alpha=0.9)
+    ax3.add_patch(rect)
+    txt = f"Cierre: {b['p_clv']:.1f}%\nScore: {b['score']:.1f}"
+    ax3.text(b['x'] + 0.5, b['piso_z'] + (b['alto_z']/2), txt, ha='center', va='center', color='white', fontsize=9, fontweight='bold')
+
+ax3.set_ylim(d1_low * 0.95, max_y_plot * 1.08)
+ax3.set_title("Rejilla de Confluencia (Heatmap por Score Global)", fontsize=13, fontweight='bold')
+ax3.set_xlim(-1, 10)
+ax3.set_xticks([]) 
+ax3.set_ylabel("Precio Proyectado (USD)")
+ax3.grid(axis='y', linestyle=':', alpha=0.3)
+ax3.legend(loc='upper left')
+
+plt.tight_layout()
+
+# ==========================================
+# 💾 EXPORTACIÓN GRÁFICA ESTÁTICA
+# ==========================================
+carpeta_actual = os.path.dirname(os.path.abspath(__file__))
+nombre_archivo = os.path.join(carpeta_actual, f"GRAFICO_CIERRES_{datetime.now().strftime('%H%M%S')}.png")
+
+plt.savefig(nombre_archivo, dpi=100)
+plt.close(fig) 
+os.startfile(nombre_archivo)
+
+============================================================
+ 📁 ARCHIVO: 04_master_screeners.py
+============================================================
+import pandas as pd
+import yfinance as yf
+import numpy as np
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import coint
+from itertools import combinations
+import matplotlib.pyplot as plt
+import os
+import json
+import sys  # <--- MAGIA PARA RECIBIR ÓRDENES DEL CONSERJE
+from datetime import datetime
+import warnings
+
+warnings.simplefilter(action='ignore')
+
+try:
+    from universo import universo, tickers
+except ImportError:
+    print("❌ Error: No se encontró 'universo.py'.")
+    sys.exit()
+
+def calcular_hurst(ts):
+    try:
+        lags = range(2, 20)
+        tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
+        poly = np.polyfit(np.log(lags), np.log(tau), 1)
+        return poly[0]*2.0
+    except:
+        return np.nan
+
+# ==========================================
+# 🎛️ CAPTURA DE ÓRDENES (CLI vs MANUAL)
+# ==========================================
+modo = None
+exportar_auto = False
+
+# Si el Conserje nos mandó argumentos (ej: python 04_master_screeners.py 1 auto)
+if len(sys.argv) > 1:
+    modo = sys.argv[1].strip()
+    if len(sys.argv) > 2 and sys.argv[2].strip().lower() == 'auto':
+        exportar_auto = True
+    print(f"\n🤖 [MODO AUTÓNOMO] Ejecutando orden del Conserje: Modo {modo}")
+else:
+    # Modo Manual (humano)
+    print("\n" + "="*60)
+    print(" 🎛️ MASTER SCREENER QUANT")
+    print("="*60)
+    print(" ¿Qué necesitás buscar hoy?")
+    print("  [1] 🏗️ CONSTRUCTOR CORE-SATELLITE (Top 2 Satélites ÚNICOS por Core)")
+    print("  [2] 🎯 ESCÁNER TÁCTICO (Oportunidades de Entrada HOY con gráficos)")
+    print("="*60)
+    modo = input("👉 Su orden (1 o 2): ").strip()
+
+# ==========================================
+# 📥 DESCARGA GLOBAL DE DATOS
+# ==========================================
+print(f"\n📥 Descargando historia de 3 años para {len(tickers)} activos...")
+df_raw = yf.download(tickers, period="3y", progress=False)
+
+if isinstance(df_raw.columns, pd.MultiIndex):
+    nivel_cero = df_raw.columns.get_level_values(0)
+    nivel_uno = df_raw.columns.get_level_values(1)
+    if 'Close' in nivel_cero: df = df_raw['Close']
+    elif 'Close' in nivel_uno: df = df_raw.xs('Close', level=1, axis=1)
+    else: df = df_raw.xs('Adj Close', level=1, axis=1) if 'Adj Close' in nivel_uno else df_raw
+else:
+    df = df_raw
+
+df = df.dropna(axis=1, how='all')
+
+if modo == '1':
+    categorias = {
+        "🛡️ DIVIDENDOS (Consumo/Defensivas)": {
+            "anclas": ["PEP", "PG", "COST"],
+            "p_value_max": 0.20,
+            "hurst_max": 0.55,
+            "ventanas": range(30, 70, 5),
+            "umbrales": [1.5, 1.6, 1.7]
+        },
+        "🚀 GROWTH (Tecnología/Volatilidad)": {
+            "anclas": ["SE", "NOK", "INTC"],
+            "p_value_max": 0.10,
+            "hurst_max": 0.45,
+            "ventanas": range(15, 50, 5),
+            "umbrales": [1.5, 1.8, 2.0]
+        },
+        "⚓ COBERTURA (Metales/Agro/Macro)": {
+            "anclas": ["DE", "BRK-B", "RIO"],
+            "p_value_max": 0.15,
+            "hurst_max": 0.50,
+            "ventanas": range(20, 60, 5),
+            "umbrales": [1.5, 1.6, 1.8]
+        }
+    }
+
+    resultados = []
+    print("\n🚀 Iniciando optimización sectorial (Fuerza Bruta)...")
+
+    for nombre_cat, config in categorias.items():
+        print(f"Buscando para: {nombre_cat}...")
+        for ancla in config["anclas"]:
+            etiquetas_ancla = universo[ancla]
+            candidatos = [t for t in tickers if not universo[t].isdisjoint(etiquetas_ancla)]
+            
+            for satelite in candidatos:
+                if ancla == satelite: continue
+                if ancla not in df.columns or satelite not in df.columns: continue
+                
+                df_par = df[[ancla, satelite]].dropna()
+                if len(df_par) < 150: continue 
+                
+                s1, s2 = df_par[ancla], df_par[satelite]
+                ratio = s1 / s2
+                
+                _, p_value, _ = coint(s1, s2)
+                hurst = calcular_hurst(ratio.values)
+                
+                if p_value < config["p_value_max"] and hurst < config["hurst_max"]: 
+                    for v in config["ventanas"]:
+                        for u in config["umbrales"]:
+                            media = ratio.rolling(window=v).mean()
+                            std = ratio.rolling(window=v).std()
+                            z_score = (ratio - media) / std
+                            entradas = (z_score > u) | (z_score < -u)
+                            num_entradas = entradas.sum()
+                            if num_entradas > 15:
+                                resultados.append({
+                                    'Categoria': nombre_cat.split(" ")[1],
+                                    'Ancla': ancla,
+                                    'Par': f"{ancla}/{satelite}", 
+                                    'Ventana': v, 'Umbral': u, 'Entradas': num_entradas
+                                })
+
+    df_resultados = pd.DataFrame(resultados)
+    print("\n" + "="*60)
+    print(" 🏆 RESULTADOS CORE-SATELLITE (TOP 2 SATÉLITES POR ANCLA)")
+    print("="*60)
+
+    top_final_para_exportar = pd.DataFrame()
+
+    for nombre_cat in categorias.keys():
+        nombre_corto = nombre_cat.split(" ")[1]
+        print(f"\n{nombre_cat}")
+        print("-" * 50)
+        
+        if not df_resultados.empty:
+            df_cat = df_resultados[df_resultados['Categoria'] == nombre_corto]
+            if not df_cat.empty:
+                df_ordenado = df_cat.sort_values(by='Entradas', ascending=False)
+                df_unicos = df_ordenado.drop_duplicates(subset=['Par'], keep='first')
+                top_por_ancla = df_unicos.groupby('Ancla').head(2)
+                top_final = top_por_ancla.sort_values(by=['Ancla', 'Entradas'], ascending=[True, False])
+                print(top_final[['Par', 'Ventana', 'Umbral', 'Entradas']].to_string(index=False))
+                top_final_para_exportar = pd.concat([top_final_para_exportar, top_final])
+            else:
+                print("  ⚠️ Ningún par superó los filtros para esta categoría.")
+        else:
+            print("  ⚠️ Ningún par superó los filtros.")
+            
+    # --- AUTOMATIZACIÓN DE WATCHLIST ---
+    if not top_final_para_exportar.empty:
+        if exportar_auto:
+            exportar = 's'
+        else:
+            exportar = input("\n👉 ¿Querés sobrescribir 'watchlist_ideal.json' con estos pares? (s/n): ").strip().lower()
+            
+        if exportar == 's':
+            nueva_watchlist = []
+            for index, row in top_final_para_exportar.iterrows():
+                t1, t2 = row['Par'].split('/')
+                nueva_watchlist.append({
+                    "t1": t1, "t2": t2,
+                    "ventana": int(row['Ventana']), "umbral": float(row['Umbral'])
+                })
+            ruta_watchlist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist_ideal.json")
+            with open(ruta_watchlist, 'w') as f:
+                json.dump(nueva_watchlist, f, indent=4)
+            print(f"\n✅ ¡Éxito! Watchlist actualizada con {len(nueva_watchlist)} pares.")
+
+elif modo == '2':
+    opcion_hl = None
+    if len(sys.argv) > 2:
+        opcion_hl = sys.argv[2].strip()
+    else:
+        print("\nSeleccioná el nivel de exigencia (Half-Life máximo):")
+        print("  [1] MODO FERRARI (Máx 15 días)")
+        print("  [2] MODO NORMAL (Máx 25 días)")
+        opcion_hl = input("👉 Opcion: ").strip()
+        
+    MAX_HALF_LIFE = 15 if opcion_hl == '1' else 25
+
+    VENTANA_MEDIA, DESVIACIONES_BANDA, UMBRAL_ENTRADA = 30, 1.5, 1.5      
+    pares_validos = []
+    for t1, t2 in combinations(tickers, 2):
+        etiquetas_comunes = universo[t1].intersection(universo[t2])
+        if len(etiquetas_comunes) > 0:
+            pares_validos.append((t1, t2, ", ".join(etiquetas_comunes)))
+
+    print(f"\n⚙️ Analizando Cointegración y Half-Life en {len(pares_validos)} cruces posibles...")
+    graficos_a_dibujar = []
+
+    for t1, t2, nexo in pares_validos:
+        if t1 not in df.columns or t2 not in df.columns: continue
+        df_par = df[[t1, t2]].dropna()
+        if len(df_par) < 200: continue
+            
+        s1, s2 = df_par[t1], df_par[t2]
+        try:
+            _, p_value, _ = coint(s1, s2)
+            if p_value > 0.05: continue
+            ratio = s1 / s2
+            y_hl = ratio.diff().dropna()
+            x_hl = ratio.shift(1).dropna()
+            if len(y_hl) < 50: continue
+            res = sm.OLS(y_hl, sm.add_constant(x_hl)).fit()
+            beta = res.params.iloc[1]
+            hl = -np.log(2) / beta if beta < 0 else np.nan
+            if pd.isna(hl) or hl > MAX_HALF_LIFE: continue
+            hurst = calcular_hurst(ratio.values)
+            if pd.isna(hurst): continue
+                
+            media = ratio.rolling(window=VENTANA_MEDIA).mean()
+            desviacion = ratio.rolling(window=VENTANA_MEDIA).std()
+            z_score_hist = (ratio - media) / desviacion
+            z_actual = z_score_hist.iloc[-1]
+            
+            if abs(z_actual) >= UMBRAL_ENTRADA:
+                banda_sup = media + (desviacion * DESVIACIONES_BANDA)
+                banda_inf = media - (desviacion * DESVIACIONES_BANDA)
+                estado = f"VENDER {t1} / COMPRAR {t2} 🔴" if z_actual >= UMBRAL_ENTRADA else f"COMPRAR {t1} / VENDER {t2} 🟢"
+                graficos_a_dibujar.append({
+                    't1': t1, 't2': t2, 'nexo': nexo, 'hl': hl, 'z_actual': z_actual, 'estado': estado, 
+                    'ratio': ratio, 'media': media, 'banda_sup': banda_sup, 'banda_inf': banda_inf
+                })
+        except: continue
+
+    if not graficos_a_dibujar:
+        print(f"\nℹ️ Hoy ningún par está dando señal de entrada con Half-Life menor a {MAX_HALF_LIFE} días.")
+    else:
+        graficos_a_dibujar = sorted(graficos_a_dibujar, key=lambda x: abs(x['z_actual']), reverse=True)
+        print("\n" + "="*85)
+        print(f" 🚀 RADAR QUANT TÁCTICO: {len(graficos_a_dibujar)} SEÑALES ACTIVAS HOY")
+        print("="*85)
+        for g in graficos_a_dibujar:
+            print(f"🔹 [{g['t1']} vs {g['t2']}] | Nexo: {g['nexo']}")
+            print(f"   ➔ Señal: {g['estado']} (Z-Score: {g['z_actual']:.2f})")
+        
+        plt.style.use('dark_background')
+        fig, axes = plt.subplots(len(graficos_a_dibujar), 1, figsize=(14, 5 * len(graficos_a_dibujar)), sharex=False)
+        if len(graficos_a_dibujar) == 1: axes = [axes]
+            
+        for idx, data in enumerate(graficos_a_dibujar):
+            ax = axes[idx]
+            fechas_plot = data['ratio'].index[-250:]
+            ax.plot(fechas_plot, data['ratio'][-250:], color='dodgerblue', linewidth=2, label='Ratio Real')
+            ax.plot(fechas_plot, data['media'][-250:], color='white', linestyle='--', linewidth=1.5, label='Media')
+            ax.plot(fechas_plot, data['banda_sup'][-250:], color='crimson', linestyle=':', alpha=0.7)
+            ax.plot(fechas_plot, data['banda_inf'][-250:], color='mediumseagreen', linestyle=':', alpha=0.7)
+            ax.fill_between(fechas_plot, data['banda_sup'][-250:], data['banda_inf'][-250:], color='gray', alpha=0.1)
+            
+            color_senial = 'red' if data['z_actual'] > 0 else 'lime'
+            ax.plot(fechas_plot[-1], data['ratio'].iloc[-1], color=color_senial, marker='o', markersize=8)
+
+            titulo = f"[{data['t1']} / {data['t2']}] Z: {data['z_actual']:.2f} | HL: {data['hl']:.1f}d | Señal: {data['estado']}"
+            ax.set_title(titulo, fontweight='bold', fontsize=11)
+            ax.grid(True, linestyle=':', alpha=0.3)
+            ax.legend(loc='upper left', fontsize=9)
+
+        plt.tight_layout()
+        carpeta_actual = os.path.dirname(os.path.abspath(__file__))
+        nombre_archivo = os.path.join(carpeta_actual, f"GRAFICO_TACTICO_{datetime.now().strftime('%H%M%S')}.png")
+        plt.savefig(nombre_archivo, dpi=100)
+        plt.close(fig) 
+        os.startfile(nombre_archivo)
+else:
+    print("⚠️ Opción no válida. Ejecutá el script de nuevo.")
+
+============================================================
+ 📁 ARCHIVO: 05_monitor_tactico.py
+============================================================
+ import os
+import json
+import time
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from datetime import datetime
+import warnings
+import winsound
+
+warnings.simplefilter(action='ignore')
+
+# ==========================================
+# ⚙️ CONFIGURACIÓN DE RUTAS Y TIEMPOS
+# ==========================================
+CARPETA_ACTUAL = os.path.dirname(os.path.abspath(__file__))
+ARCHIVO_CARTERA = os.path.join(CARPETA_ACTUAL, "cartera_hoy.json")
+ARCHIVO_WATCHLIST = os.path.join(CARPETA_ACTUAL, "watchlist_ideal.json")
+
+# 1800 segundos = 30 minutos.
+INTERVALO_CHEQUEO = 1800 
+
+def cargar_json(ruta):
+    if os.path.exists(ruta):
+        try:
+            with open(ruta, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {} if "cartera" in ruta else []
+    return {} if "cartera" in ruta else []
+
+def inicializar_watchlist():
+    if not os.path.exists(ARCHIVO_WATCHLIST):
+        ejemplo = [
+            {"t1": "PG", "t2": "CL", "ventana": 45, "umbral": 1.5},
+            {"t1": "PEP", "t2": "IBM", "ventana": 40, "umbral": 1.5}
+        ]
+        with open(ARCHIVO_WATCHLIST, 'w') as f:
+            json.dump(ejemplo, f, indent=4)
+            
+# ==========================================
+# 🔊 MOTOR DE AUDIO (NUEVO)
+# ==========================================
+def sonar_alerta(tipo):
+    """Emite una secuencia de bips según la importancia"""
+    if tipo == 'COMPRAR':
+        # Tono ascendente (Frecuencia, Duración ms)
+        winsound.Beep(1500, 700)
+        winsound.Beep(1500, 700)
+        winsound.Beep(1500, 700)
+        winsound.Beep(1500, 700)
+    elif tipo == 'VENDER':
+        # Tono descendente
+        winsound.Beep(1000, 200)
+        winsound.Beep(1000, 700)
+        winsound.Beep(1000, 200)
+        winsound.Beep(1000, 700)
+        winsound.Beep(1000, 200)
+    else:
+        # Bip neutro para errores o avisos
+        winsound.Beep(800, 200)
+
+# ==========================================
+# 📊 MOTOR GRÁFICO (GUARDA Y ABRE ALERTA)
+# ==========================================
+def plotear_alerta(t1, t2, datos, tipo_alerta, umbral):
+    """Genera y guarda un gráfico estático de la alarma, y lo abre en el visor por defecto"""
+    sonar_alerta(tipo_alerta)
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(12, 5))
+    
+    # Tomamos solo las últimas 150 ruedas para hacer un "zoom in" a la acción reciente
+    fechas = datos['fechas'][-150:]
+    ratio = datos['ratio'][-150:]
+    media = datos['media'][-150:]
+    
+    # Calculamos las bandas exactas del umbral
+    std = datos['std'][-150:]
+    banda_sup = media + (std * umbral)
+    banda_inf = media - (std * umbral)
+
+    # Ploteo de líneas
+    ax.plot(fechas, ratio, color='dodgerblue', linewidth=2, label=f'Ratio {t1}/{t2}')
+    ax.plot(fechas, media, color='white', linestyle='--', linewidth=1.5, label=f'Media ({len(media)}D)')
+    ax.plot(fechas, banda_sup, color='crimson', linestyle=':', alpha=0.7)
+    ax.plot(fechas, banda_inf, color='mediumseagreen', linestyle=':', alpha=0.7)
+    
+    ax.fill_between(fechas, banda_sup, banda_inf, color='gray', alpha=0.1)
+
+    # Resaltar el punto de ruptura (Hoy)
+    color_punto = 'lime' if tipo_alerta == 'COMPRAR' else 'red'
+    ax.plot(fechas[-1], ratio.iloc[-1], color=color_punto, marker='o', markersize=8)
+
+    # Formato
+    z_actual = datos['z_actual']
+    titulo = f"🚨 ALERTA DE {tipo_alerta}: {t1} vs {t2} | Z-Score Actual: {z_actual:.2f}"
+    ax.set_title(titulo, fontweight='bold', fontsize=14, color=color_punto)
+    ax.grid(True, linestyle=':', alpha=0.3)
+    ax.legend(loc='upper left')
+
+    plt.tight_layout()
+    
+    # 1. Guardamos la imagen en la carpeta
+    nombre_archivo = os.path.join(CARPETA_ACTUAL, f"ALERTA_{t1}_{t2}_{datetime.now().strftime('%H%M%S')}.png")
+    plt.savefig(nombre_archivo)
+    plt.close(fig) # Cerramos la figura en memoria para no colgar Python
+    
+    # 2. Abrimos la imagen con el visor predeterminado de Windows
+    os.startfile(nombre_archivo)
+    
+
+# ==========================================
+# 🧠 MOTOR DE CÁLCULO EN VIVO
+# ==========================================
+def calcular_zscore_live(t1, t2, ventana):
+    """Descarga los últimos ~150 días y devuelve un diccionario con toda la data matemática"""
+    try:
+        df = yf.download([t1, t2], period="150d", progress=False)
+        
+        if isinstance(df.columns, pd.MultiIndex):
+            df_close = df.xs('Close', level=1, axis=1) if 'Close' in df.columns.get_level_values(1) else df['Close']
+        else:
+            df_close = df
+
+        if t1 not in df_close.columns or t2 not in df_close.columns:
+            return None
+            
+        df_par = df_close[[t1, t2]].dropna()
+        if len(df_par) < ventana + 10:
+            return None 
+            
+        ratio = df_par[t1] / df_par[t2]
+        media = ratio.rolling(window=ventana).mean()
+        std = ratio.rolling(window=ventana).std()
+        z_score = (ratio - media) / std
+        
+        # Ahora devolvemos el paquete de datos completo para el gráfico
+        return {
+            "z_actual": z_score.iloc[-1],
+            "ratio": ratio,
+            "media": media,
+            "std": std,
+            "fechas": ratio.index
+        }
+        
+    except Exception as e:
+        print(f"  ⚠️ Error calculando par {t1}/{t2}: {e}")
+        return None
+
+# ==========================================
+# 🚀 BUCLE PRINCIPAL DEL CENTINELA
+# ==========================================
+def iniciar_monitor():
+    print("\n" + "="*60)
+    print(" 🦅 MONITOR TÁCTICO DE PARES (CORE-SATELLITE) INICIADO")
+    print("="*60)
+    print(f"⏱️  Chequeos programados cada {INTERVALO_CHEQUEO / 60:.0f} minutos.")
+    print("👉 Apretá Ctrl+C para detener el centinela.\n")
+
+    inicializar_watchlist()
+    ultimo_chequeo = 0
+
+    try:
+        while True:
+            ahora = time.time()
+            
+            if ahora - ultimo_chequeo >= INTERVALO_CHEQUEO:
+                hora_actual = datetime.now().strftime('%H:%M:%S')
+                print(f"🔍 [ {hora_actual} ] Escaneando el mercado...")
+                
+                cartera = cargar_json(ARCHIVO_CARTERA)
+                watchlist = cargar_json(ARCHIVO_WATCHLIST)
+                
+                if not watchlist:
+                    print("  ⚠️ La watchlist está vacía. Agregá pares en 'watchlist_ideal.json'.")
+                
+                alertas_generadas = 0
+
+                for candidato in watchlist:
+                    t1, t2 = candidato["t1"], candidato["t2"]
+                    ventana, umbral = candidato["ventana"], candidato["umbral"]
+                    
+                    datos_calc = calcular_zscore_live(t1, t2, ventana)
+                    
+                    if datos_calc is None:
+                        continue
+                        
+                    z_actual = datos_calc["z_actual"]
+                    tenencia_t1 = cartera.get(t1, 0)
+                    
+                    # ALERTA DE VENTA
+                    if z_actual >= umbral:
+                        if tenencia_t1 > 0:
+                            print(f"  🚨 ALERTA GATILLO: ¡VENDER {t1}! Rotar capital a {t2}.")
+                            print(f"     ➔ El Z-Score voló a {z_actual:.2f} (Umbral: {umbral})")
+                            plotear_alerta(t1, t2, datos_calc, 'VENDER', umbral)
+                            alertas_generadas += 1
+                            
+                    # ALERTA DE COMPRA
+                    elif z_actual <= -umbral:
+                        if tenencia_t1 == 0:
+                            print(f"  🚨 ALERTA GATILLO: ¡COMPRAR {t1}! Oportunidad de entrada frente a {t2}.")
+                            print(f"     ➔ El Z-Score cayó a {z_actual:.2f} (Umbral: -{umbral})")
+                            plotear_alerta(t1, t2, datos_calc, 'COMPRAR', umbral)
+                            alertas_generadas += 1
+                            
+                if alertas_generadas == 0:
+                    print("  ✅ Todo tranquilo. Ningún par rompió los umbrales de cointegración.")
+                
+                print("-" * 60)
+                ultimo_chequeo = ahora
+                
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Monitor Táctico detenido por el usuario.")
+    finally:
+        # Cierra las ventanas de gráficos si detenemos el script a la fuerza
+        plt.close('all') 
+
+if __name__ == "__main__":
+    iniciar_monitor()
+
+============================================================
+ 📁 ARCHIVO: 06_grabador_rueda_ggal.py
+============================================================
+import time
+import re
+import os
+import sys
+import json
+import pandas as pd
+import numpy as np
+from matplotlib.pyplot import subplots
+import matplotlib.pyplot as plt
+from pyhomebroker import HomeBroker
+from credenciales import DNI, BROKER_ID
+import warnings
+
+try:
+    import winsound
+except ImportError:
+    pass
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# ==========================================
+# 🔐 SEGURIDAD: LECTURA DE SESIÓN
+# ==========================================
+USUARIO_SESION = os.environ.get('HB_USER')
+PASSWORD_SESION = os.environ.get('HB_PASS')
+
+if not USUARIO_SESION or not PASSWORD_SESION:
+    print("❌ ALERTA DE SEGURIDAD: Credenciales no encontradas en la memoria.")
+    print("Por favor, ejecutá este radar a través del 'Conserje' maestro.")
+    sys.exit()
+
+# ==========================================
+# ⚙️ CONFIGURACIÓN DEL REGISTRO
+# ==========================================
+ARCHIVO_CSV = "registro_valuacion.csv"
+INTERVALO_REGISTRO_SEGUNDOS = 10  
+ultima_vez_registrado = 0
+
+# ==========================================
+# 🧠 CARGA DEL CEREBRO MATINAL (JSON)
+# ==========================================
+ruta_json = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parametros_ggal.json")
+try:
+    with open(ruta_json, "r") as f:
+        p_macro = json.load(f)
+except Exception as e:
+    print(f"⚠️ No se encontró el archivo JSON de calibración o hay un error: {e}")
+    p_macro = None
+
+# ==========================================
+# 🛰️ VARIABLES GLOBALES
+# ==========================================
+df_opciones = pd.DataFrame()
+precio_subyacente = 0.0
+apertura_subyacente = 0.0
+maximo_subyacente = 0.0
+minimo_subyacente = 0.0
+
+precio_adr = 0.0
+ccl_implicito = 0.0
+ultima_vez_adr = 0
+INTERVALO_ADR = 60  
+
+# ==========================================
+# 🔊 MOTORES DE AUDIO
+# ==========================================
+def sonar_ratio(estado):
+    """Emite sonidos distintos según la valuación del spread"""
+    try:
+        if estado == "BARATO": winsound.Beep(2000, 100) # Oportunidad aguda
+    except: pass
+
+def check_and_alert(target, dist, nivel_nombre):
+    """Verifica rupturas y emite alertas sonoras"""
+    if dist >= target:
+        try:
+            if "P75" in nivel_nombre: winsound.Beep(2500, 300) 
+            elif "P50" in nivel_nombre: winsound.Beep(1500, 200)
+            elif "P25" in nivel_nombre: winsound.Beep(1000, 100) 
+            elif "Caja" in nivel_nombre: winsound.Beep(800, 400) 
+        except: pass
+        return "✅ ALCANZADO"
+    return f"Falta {target - dist:.2f}%"
+
+# ==========================================
+# 🛠️ CALLBACKS DEL BROKER
+# ==========================================
+def on_options(online, quotes):
+    global df_opciones
+    thisData = quotes.copy()
+    if df_opciones.empty:
+        df_opciones = thisData
+    else:
+        df_opciones.update(thisData)
+
+def on_securities(online, quotes):
+    global precio_subyacente, apertura_subyacente, maximo_subyacente, minimo_subyacente
+    df = quotes.copy()
+    if not df.empty:
+        df = df.reset_index()
+        c_sym = next((c for c in df.columns if c.lower() in ['symbol', 'ticker', 'index']), 'symbol')
+        c_last = next((c for c in df.columns if c.lower() in ['last', 'ultimo', 'close']), 'last')
+        c_open = next((c for c in df.columns if c.lower() in ['open', 'apertura']), 'open')
+        c_high = next((c for c in df.columns if c.lower() in ['high', 'maximo']), 'high')
+        c_low = next((c for c in df.columns if c.lower() in ['low', 'minimo']), 'low')
+        
+        if c_sym in df.columns and c_last in df.columns:
+            ggal_data = df[df[c_sym] == 'GGAL']
+            if not ggal_data.empty:
+                precio_subyacente = float(ggal_data[c_last].iloc[-1])
+                
+                if c_open in ggal_data.columns:
+                    apertura_subyacente = float(ggal_data[c_open].iloc[-1])
+                
+                if c_high in ggal_data.columns and not pd.isna(ggal_data[c_high].iloc[-1]):
+                    maximo_subyacente = float(ggal_data[c_high].iloc[-1])
+                elif precio_subyacente > maximo_subyacente:
+                    maximo_subyacente = precio_subyacente
+                    
+                if c_low in ggal_data.columns and not pd.isna(ggal_data[c_low].iloc[-1]):
+                    minimo_subyacente = float(ggal_data[c_low].iloc[-1])
+                elif minimo_subyacente == 0 or precio_subyacente < minimo_subyacente:
+                    minimo_subyacente = precio_subyacente
+
+# ==========================================
+# 🧠 MOTOR DE VALUACIÓN DE SPREADS
+# ==========================================
+def procesar_spreads(res_df, tipo_opcion):
+    ratios_temp, x_regresion_temp, strikes_referencia = [], [], []
+    
+    for i in range(len(res_df) - 1):
+        b_baja, b_alta = res_df.iloc[i], res_df.iloc[i+1]
+        dist = b_alta['strike_val'] - b_baja['strike_val']
+        
+        if tipo_opcion == 'CALL':
+            costo = b_baja['ask_val'] - b_alta['bid_val']
+            if costo > 0 and dist > 0 and costo <= dist:
+                ratios_temp.append(dist / costo)
+                x_regresion_temp.append(b_baja['strike_val'] + costo)
+                strikes_referencia.append(b_baja['strike_val'])
+        else: # PUT
+            costo = b_alta['ask_val'] - b_baja['bid_val']
+            if costo > 0 and dist > 0 and costo <= dist:
+                ratios_temp.append(dist / costo)
+                x_regresion_temp.append(b_alta['strike_val'] - costo)
+                strikes_referencia.append(b_alta['strike_val'])
+
+    m, b = None, None
+    if precio_subyacente > 0 and ratios_temp:
+        if tipo_opcion == 'CALL':
+            puntos_otm = [(x, y) for x, y, k in zip(x_regresion_temp, ratios_temp, strikes_referencia) if k > precio_subyacente][:6]
+        else:
+            puntos_otm = [(x, y) for x, y, k in zip(x_regresion_temp, ratios_temp, strikes_referencia) if k < precio_subyacente][-6:]
+            
+        if len(puntos_otm) >= 2:
+            x_m = np.array([p[0] for p in puntos_otm])
+            y_m = np.array([p[1] for p in puntos_otm])
+            m, b = np.polyfit(x_m, np.log(y_m), 1)
+
+    ratios_armado, ratios_desarme, eje_x_strikes, eje_x_breakevens, tabla = [], [], [], [], []
+    
+    for i in range(len(res_df) - 1):
+        b_baja, b_alta = res_df.iloc[i], res_df.iloc[i+1]
+        distancia = b_alta['strike_val'] - b_baja['strike_val']
+        
+        s_bajo = str(int(b_baja['strike_val'] // 100))
+        s_alto = str(int(b_alta['strike_val'] // 100))
+        par_nombre = f"{s_bajo}/{s_alto}"
+        
+        if tipo_opcion == 'CALL':
+            costo_real = b_baja['ask_val'] - b_alta['bid_val']
+            valor_desarme = b_baja['bid_val'] - b_alta['ask_val']
+            punto_equilibrio = b_baja['strike_val'] + costo_real
+            strike_grafico = b_baja['strike_val']
+            ask_e, bid_e = b_baja['ask_val'], b_alta['bid_val']
+        else: # PUT
+            costo_real = b_alta['ask_val'] - b_baja['bid_val']
+            valor_desarme = b_alta['bid_val'] - b_baja['ask_val']
+            punto_equilibrio = b_alta['strike_val'] - costo_real
+            strike_grafico = b_alta['strike_val']
+            ask_e, bid_e = b_alta['ask_val'], b_baja['bid_val']
+
+        if costo_real > 0 and distancia > 0 and costo_real <= distancia:
+            ratio_armado = distancia / costo_real
+            ratios_armado.append(ratio_armado)
+            eje_x_strikes.append(strike_grafico)
+            
+            if valor_desarme > 0 and valor_desarme <= distancia:
+                ratios_desarme.append(distancia / valor_desarme)
+            else:
+                ratios_desarme.append(np.nan)
+                
+            eje_x_breakevens.append(punto_equilibrio)
+            
+            if m is not None:
+                ratio_teorico = np.exp(m * punto_equilibrio + b)
+                costo_teorico = distancia / ratio_teorico
+                desvio_pesos = costo_real - costo_teorico
+                condicion = "CARO" if desvio_pesos > 0 else "BARATO"
+                
+                tabla.append({
+                    'TIPO': tipo_opcion, 'PAR': par_nombre, 'ASK_ENTRA': ask_e,
+                    'BID_ENTRA': bid_e, 'C_REAL': costo_real, 'C_TEORICO': costo_teorico,
+                    'DIF_PESOS': desvio_pesos, 'ESTADO': condicion
+                })
+                
+    return tabla, ratios_armado, ratios_desarme, eje_x_strikes, eje_x_breakevens, m, b
+
+# ==========================================
+# 🚀 CONEXIÓN Y BUCLE PRINCIPAL
+# ==========================================
+hb = HomeBroker(BROKER_ID, on_options=on_options, on_securities=on_securities)
+
+plt.ion() 
+fig, (ax_puts, ax_calls) = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
+
+try:
+    hb.auth.login(dni=DNI, user=USUARIO_SESION, password=PASSWORD_SESION)
+    print("\n🔌 Conectando al motor de eventos...")
+    hb.online.connect()
+    time.sleep(2)
+    
+    with open("bases.txt", "r") as f:
+        monitor = [str(line).strip().upper() for line in f if line.strip()]
+
+    hb.online.subscribe_options()
+    hb.online.subscribe_securities('bluechips', '24hs')
+
+    print(f"\n🚀 Sistema de Valuación Dual (Calls/Puts) Iniciado...")
+
+    while True:
+        ahora = time.time()
+
+        if not df_opciones.empty:
+            df = df_opciones.reset_index()
+            cols = df.columns
+            
+            c_sym = next((c for c in cols if c.lower() in ['symbol', 'ticker', 'index']), 'symbol')
+            c_bid = next((c for c in cols if c.lower() in ['bid', 'compra']), 'bid')
+            c_ask = next((c for c in cols if c.lower() in ['ask', 'venta']), 'ask')
+
+            res = df[df[c_sym].isin(monitor)].copy()
+
+            if not res.empty:
+                res['bid_val'] = pd.to_numeric(res[c_bid], errors='coerce').fillna(0)
+                res['ask_val'] = pd.to_numeric(res[c_ask], errors='coerce').fillna(0)
+                
+                res['strike_val'] = res[c_sym].apply(lambda x: float(re.findall(r'\d+', x)[0]) if re.findall(r'\d+', x) else 0)
+                res['strike_val'] = res['strike_val'].apply(lambda x: x / 10 if x > 20000 else x)
+                
+                res_calls = res[res[c_sym].str.contains(r'C\d+')].sort_values('strike_val').reset_index(drop=True)
+                res_puts  = res[res[c_sym].str.contains(r'V\d+')].sort_values('strike_val').reset_index(drop=True)
+                
+                tabla_C, r_arm_C, r_des_C, x_str_C, x_be_C, m_C, b_C = procesar_spreads(res_calls, 'CALL')
+                tabla_P, r_arm_P, r_des_P, x_str_P, x_be_P, m_P, b_P = procesar_spreads(res_puts, 'PUT')
+                
+                tabla_completa = tabla_C + tabla_P
+
+                if tabla_completa:
+                    print("\033[H\033[J", end="") 
+                    
+                    # 1. ACTUALIZACIÓN DEL ADR Y CCL
+                    if ahora - ultima_vez_adr >= INTERVALO_ADR:
+                        try:
+                            df_adr = yf.download("GGAL", period="1d", interval="1m", progress=False)
+                            if not df_adr.empty:
+                                if isinstance(df_adr.columns, pd.MultiIndex):
+                                    df_adr.columns = df_adr.columns.get_level_values(0)
+                                precio_adr = float(df_adr['Close'].iloc[-1])
+                        except Exception: pass
+                        ultima_vez_adr = ahora
+
+                    if precio_adr > 0 and precio_subyacente > 0:
+                        ccl_implicito = (precio_subyacente * 10) / precio_adr
+
+                    # EL NUEVO PANEL SUPERIOR
+                    print("="*105)
+                    print(f" 📊 PANEL DUAL QUANT GGAL | Spot Local: ${precio_subyacente:.2f} | Spot ADR: U$S {precio_adr:.2f} | CCL: ${ccl_implicito:.2f}")
+                    print("="*105)
+                    
+                    # 2. INYECCIÓN DEL ARCHIVO JSON Y MAPA DE PRECIOS
+                    if p_macro and minimo_subyacente > 0 and maximo_subyacente > 0:
+                        try:
+                            c_15, c_30 = p_macro['CAJAS_INTRADIA']['15M'], p_macro['CAJAS_INTRADIA']['30M']
+                            c_45, c_60 = p_macro['CAJAS_INTRADIA']['45M'], p_macro['CAJAS_INTRADIA']['60M']
+                            
+                            t_p25 = float(str(p_macro['TARGETS_INTRADIA']['P25']).replace('np.float64(','').replace(')',''))
+                            t_p50 = float(str(p_macro['TARGETS_INTRADIA']['P50']).replace('np.float64(','').replace(')',''))
+                            t_p75 = float(str(p_macro['TARGETS_INTRADIA']['P75']).replace('np.float64(','').replace(')',''))
+
+                            dist_up = ((precio_subyacente - minimo_subyacente) / minimo_subyacente) * 100 
+                            dist_down = ((maximo_subyacente - precio_subyacente) / maximo_subyacente) * 100 
+                            
+                            ps_75, ps_50, ps_25 = minimo_subyacente * (1 + t_p75/100), minimo_subyacente * (1 + t_p50/100), minimo_subyacente * (1 + t_p25/100)
+                            pi_75, pi_50, pi_25 = maximo_subyacente * (1 - t_p75/100), maximo_subyacente * (1 - t_p50/100), maximo_subyacente * (1 - t_p25/100)
+                            
+                            op = apertura_subyacente
+                            cs_15, cs_30, cs_45, cs_60 = op*(1+c_15/100), op*(1+c_30/100), op*(1+c_45/100), op*(1+c_60/100)
+                            ci_15, ci_30, ci_45, ci_60 = op*(1-c_15/100), op*(1-c_30/100), op*(1-c_45/100), op*(1-c_60/100)
+
+                            dist_apertura_up = ((precio_subyacente - op) / op) * 100 if precio_subyacente >= op else 0
+                            dist_apertura_down = ((op - precio_subyacente) / op) * 100 if precio_subyacente < op else 0
+                            
+                            if dist_apertura_up >= c_60 or dist_apertura_down >= c_60:
+                                check_and_alert(c_60, max(dist_apertura_up, dist_apertura_down), "Caja")
+
+                            print(f" Proy. Sup. P75: ${ps_75:>8.2f} | {check_and_alert(t_p75, dist_up, 'Sup P75'):<13} |")
+                            print(f" Proy. Sup. P50: ${ps_50:>8.2f} | {check_and_alert(t_p50, dist_up, 'Sup P50'):<13} |")
+                            print(f" Proy. Sup. P25: ${ps_25:>8.2f} | {check_and_alert(t_p25, dist_up, 'Sup P25'):<13} |")
+                            print("")
+                            print(f" Sup                    ${cs_15:>8.2f} | ${cs_30:>8.2f} | ${cs_45:>8.2f} | ${cs_60:>8.2f} |")
+                            print(f" Temporalidad de caja:     15m     |    30m     |    45m     |    60m     |")
+                            print(f" Inf                    ${ci_15:>8.2f} | ${ci_30:>8.2f} | ${ci_45:>8.2f} | ${ci_60:>8.2f} |")
+                            print("")
+                            print(f" Proy. Inf. P25: ${pi_25:>8.2f} | {check_and_alert(t_p25, dist_down, 'Inf P25'):<13} |")
+                            print(f" Proy. Inf. P50: ${pi_50:>8.2f} | {check_and_alert(t_p50, dist_down, 'Inf P50'):<13} |")
+                            print(f" Proy. Inf. P75: ${pi_75:>8.2f} | {check_and_alert(t_p75, dist_down, 'Inf P75'):<13} |")
+                            print("="*105)
+
+                        except Exception as e:
+                            print(f" ⚠️ Error en cálculos de proyección: {e}")
+
+                    # 3. RENDERIZADO DE TABLA LADO A LADO (HUD)
+                    df_C = pd.DataFrame(tabla_C) if tabla_C else pd.DataFrame(columns=['PAR', 'ASK_ENTRA', 'BID_ENTRA', 'C_REAL', 'C_TEORICO', 'DIF_PESOS', 'ESTADO'])
+                    df_P = pd.DataFrame(tabla_P) if tabla_P else pd.DataFrame(columns=['PAR', 'ASK_ENTRA', 'BID_ENTRA', 'C_REAL', 'C_TEORICO', 'DIF_PESOS', 'ESTADO'])
+
+                    umb = -5.0 
+                    if not df_C.empty and df_C['DIF_PESOS'].min() < umb: sonar_ratio("BARATO")
+                    if not df_P.empty and df_P['DIF_PESOS'].min() < umb: sonar_ratio("BARATO")
+
+                    if not df_C.empty: df_C['ESTADO'] = df_C['ESTADO'].apply(lambda x: "🔴" if x == "CARO" else "🟢")
+                    if not df_P.empty: df_P['ESTADO'] = df_P['ESTADO'].apply(lambda x: "🔴" if x == "CARO" else "🟢")
+
+                    df_merged = pd.merge(df_C, df_P, on='PAR', how='outer', suffixes=('_C', '_P'))
+                    df_merged['strike_sort'] = df_merged['PAR'].apply(lambda x: float(x.split('/')[0]))
+                    df_merged = df_merged.sort_values('strike_sort').drop('strike_sort', axis=1)
+
+                    df_final = pd.DataFrame()
+                    df_final['PAR']    = df_merged['PAR']
+                    df_final['A_CALL'] = df_merged['ASK_ENTRA_C']
+                    df_final['B_CALL'] = df_merged['BID_ENTRA_C']
+                    df_final['R_CALL'] = df_merged['C_REAL_C']
+                    df_final['T_CALL'] = df_merged['C_TEORICO_C']
+                    df_final['DIF_C']  = df_merged['DIF_PESOS_C']
+                    df_final['E_C']    = df_merged['ESTADO_C'].fillna(" ")
+                    df_final['|']      = '|'
+                    df_final['A_PUT']  = df_merged['ASK_ENTRA_P']
+                    df_final['B_PUT']  = df_merged['BID_ENTRA_P']
+                    df_final['R_PUT']  = df_merged['C_REAL_P']
+                    df_final['T_PUT']  = df_merged['C_TEORICO_P']
+                    df_final['DIF_P']  = df_merged['DIF_PESOS_P']
+                    df_final['E_P']    = df_merged['ESTADO_P'].fillna(" ")
+
+                    formato_nums = lambda x: f"{x:>7.2f}" if pd.notnull(x) else "   --- "
+                    formatters = {col: formato_nums for col in ['A_CALL', 'B_CALL', 'R_CALL', 'T_CALL', 'DIF_C', 'A_PUT', 'B_PUT', 'R_PUT', 'T_PUT', 'DIF_P']}
+                    
+                    print(df_final.to_string(index=False, formatters=formatters))
+                    print("="*105)
+
+                    if ahora - ultima_vez_registrado >= INTERVALO_REGISTRO_SEGUNDOS:
+                        df_log = pd.DataFrame(tabla_completa)
+                        if not df_log.empty:
+                            df_log.insert(0, 'Fecha_Hora', time.strftime('%Y-%m-%d %H:%M:%S'))
+                            df_log.insert(1, 'Subyacente', precio_subyacente)
+                            df_log.to_csv(ARCHIVO_CSV, mode='a', header=not os.path.exists(ARCHIVO_CSV), index=False)
+                        ultima_vez_registrado = ahora
+
+                # --- ACTUALIZACIÓN GRÁFICA DUAL ---
+                ax_puts.clear()
+                ax_calls.clear()
+                
+                if r_arm_P:
+                    ax_puts.plot(x_str_P, r_des_P, marker='v', linestyle=':', color='crimson', linewidth=1.5, alpha=0.7)
+                    ax_puts.plot(x_str_P, r_arm_P, marker='o', linestyle='-', color='dodgerblue', linewidth=2)
+                    if m_P is not None:
+                        x_teo_be_P = np.array(x_be_P)
+                        y_teo_P = np.exp(m_P * x_teo_be_P + b_P)
+                        ax_puts.plot(x_teo_be_P, y_teo_P, color='orange', marker='x', linestyle='--', linewidth=2)
+                    ax_puts.axvline(x=precio_subyacente, color='mediumseagreen', linestyle='-', linewidth=2, label=f'Spot: {precio_subyacente:.2f}')
+                    ax_puts.set_title("BEAR PUTS", fontsize=12, fontweight='bold')
+                    ax_puts.set_ylabel("Múltiplo de Retorno (Log)")
+                    ax_puts.set_xticks(x_str_P)
+                    ax_puts.set_xticklabels([t['PAR'] for t in tabla_P], rotation=45, ha='right', fontsize=8)
+                    ax_puts.grid(True, which="both", ls="--", alpha=0.5)
+
+                if r_arm_C:
+                    ax_calls.plot(x_str_C, r_des_C, marker='v', linestyle=':', color='crimson', linewidth=1.5, alpha=0.7, label='Salida')
+                    ax_calls.plot(x_str_C, r_arm_C, marker='o', linestyle='-', color='dodgerblue', linewidth=2, label='Armado')
+                    if m_C is not None:
+                        x_teo_be_C = np.array(x_be_C)
+                        y_teo_C = np.exp(m_C * x_teo_be_C + b_C)
+                        ax_calls.plot(x_teo_be_C, y_teo_C, color='orange', marker='x', linestyle='--', linewidth=2, label='Teórico (BE)')
+                    ax_calls.axvline(x=precio_subyacente, color='mediumseagreen', linestyle='-', linewidth=2, label=f'Spot: {precio_subyacente:.2f}')
+                    ax_calls.set_title("BULL CALLS", fontsize=12, fontweight='bold')
+                    ax_calls.set_xticks(x_str_C)
+                    ax_calls.set_xticklabels([t['PAR'] for t in tabla_C], rotation=45, ha='right', fontsize=8)
+                    ax_calls.grid(True, which="both", ls="--", alpha=0.5)
+                    ax_calls.legend(loc='upper right', fontsize=8)
+                
+                ax_puts.set_yscale('log')
+                ax_calls.set_yscale('log')
+                fig.suptitle(f"Radiografía de Liquidez - GGAL ADR", fontsize=14, fontweight='bold')
+                fig.tight_layout()
+
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    print("\n🛑 Deteniendo radar...")
+except Exception as e:
+    print(f"❌ Error en ejecución: {e}")
+finally:
+    try:
+        hb.online.disconnect()
+    except:
+        pass
+    plt.ioff()
+    plt.show()
+    print("\n🔌 Desconectado.")
+
+============================================================
+ 📁 ARCHIVO: conserje.py
+============================================================
+import os
+import json
+from datetime import datetime
+
+# Obligamos a Python a usar EXACTAMENTE la carpeta donde está conserje.py
+CARPETA_ACTUAL = os.path.dirname(os.path.abspath(__file__))
+ARCHIVO_CARTERA = os.path.join(CARPETA_ACTUAL, "cartera_hoy.json")
+ARCHIVO_RATIOS = os.path.join(CARPETA_ACTUAL, "ratios_cedear.json")
+
+def inicializar_archivos():
+    """Crea los archivos base si es la primera vez que se corre el script"""
+    if not os.path.exists(ARCHIVO_RATIOS):
+        ratios_base = {
+            "AAPL": 10, "KO": 5, "PEP": 6, "PG": 5, 
+            "COST": 12, "IBM": 5, "RIO": 4, "CAT": 10
+        }
+        with open(ARCHIVO_RATIOS, 'w') as f:
+            json.dump(ratios_base, f, indent=4)
+            
+    if not os.path.exists(ARCHIVO_CARTERA):
+        with open(ARCHIVO_CARTERA, 'w') as f:
+            json.dump({}, f, indent=4)
+
+# Ejecutamos la inicialización apenas arranca el script
+inicializar_archivos()
+
+def cargar_json(ruta):
+    if os.path.exists(ruta):
+        try:
+            with open(ruta, 'r') as f:
+                return json.load(f)
+        except Exception:
+            # Si el archivo está en blanco o el formato está roto, devuelve vacío sin explotar
+            return {} 
+    return {}
+
+def guardar_json(ruta, datos):
+    with open(ruta, 'w') as f:
+        json.dump(datos, f, indent=4)
+
+def cargar_operacion(ticker, cantidad, es_cedear=False):
+    cartera = cargar_json(ARCHIVO_CARTERA)
+    
+    if es_cedear:
+        ratios = cargar_json(ARCHIVO_RATIOS)
+        if ticker not in ratios:
+            print(f"\n❌ Error: No tengo el ratio de conversión para {ticker}.")
+            print("Agregalo manualmente abriendo el archivo 'ratios_cedear.json'.")
+            return
+            
+        ratio = ratios[ticker]
+        cantidad_adr = cantidad / ratio
+        print(f"🔄 Conversión automática: {cantidad} CEDEARs (Ratio {ratio}:1) = {cantidad_adr:.2f} ADRs")
+    else:
+        cantidad_adr = cantidad
+        
+    # Suma o resta la cantidad operada a lo que ya tenías
+    cartera[ticker] = cartera.get(ticker, 0.0) + cantidad_adr
+    
+    # Limpieza: si vendiste todo y quedó en 0, borra el ticker del radar
+    if abs(cartera[ticker]) < 0.01:
+        del cartera[ticker]
+        print(f"🧹 Posición de {ticker} cerrada. Eliminada de la vigilancia.")
+        
+    guardar_json(ARCHIVO_CARTERA, cartera)
+    print(f"✅ Cartera actualizada. Posición actual de {ticker}: {cartera.get(ticker, 0):.2f} ADRs\n")
+
+# ... (ACÁ SIGUE TU CÓDIGO CON def obtener_scripts_locales() HACIA ABAJO) ...
+def obtener_scripts_locales():
+    mi_nombre = os.path.basename(__file__)
+    archivos = [f for f in os.listdir(CARPETA_ACTUAL) if f.endswith('.py') and f != mi_nombre]
+    return sorted(archivos)
+
+def exportar_para_gemini(scripts):
+    """Empaqueta todos los scripts en un solo .txt para alimentar al LLM"""
+    nombre_salida = os.path.join(CARPETA_ACTUAL, "LLM_Contexto_Quant.txt")
+    try:
+        with open(nombre_salida, "w", encoding="utf-8") as out_file:
+            out_file.write(f"FECHA DE EXPORTACIÓN: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            out_file.write("ESTE ARCHIVO CONTIENE EL ECOSISTEMA QUANT COMPLETO.\n\n")
+            for script in scripts:
+                out_file.write(f"{'='*60}\n 📁 ARCHIVO: {script}\n{'='*60}\n")
+                with open(os.path.join(CARPETA_ACTUAL, script), "r", encoding="utf-8") as in_file:
+                    out_file.write(in_file.read())
+                out_file.write("\n\n")
+        return True, nombre_salida
+    except Exception as e:
+        return False, str(e)
+    
+# ==========================================
+# 🧠 EJECUCIÓN DIRECTA (Menú Interactivo)
+# ==========================================
+while True:
+    print("\n" + "="*55)
+    print(" 👔 ASISTENTE QUANT - MANTENIMIENTO Y CARTERA")
+    print("="*55)
+
+    scripts_disponibles = obtener_scripts_locales()
+    print(f"📁 Se detectaron {len(scripts_disponibles)} scripts en la carpeta:\n")
+    
+    # ACÁ DEVUELVO LA VISUALIZACIÓN DE TUS ARCHIVOS
+    for script in scripts_disponibles:
+        print(f"  - {script}")
+
+    print("-" * 55)
+    print(" [1]  Ver mi cartera actual")
+    print(" [98] Cargar operación local (CEDEARs)")
+    print(" [99] Cargar operación exterior (ADRs directos)")
+    print(" [90] Exportar ecosistema para Gemini")
+    print(" [0]  Salir (o apretá Enter en blanco)")
+    print("="*55)
+
+    opcion = input("\n👉 Su orden: ").strip()
+
+    if opcion == '1':
+        cartera = cargar_json(ARCHIVO_CARTERA)
+        print("\n💼 TU CARTERA ACTUAL (Expresada en ADRs):")
+        if not cartera:
+            print("   La cartera está vacía.")
+        else:
+            for t, cant in cartera.items():
+                print(f"   - {t}: {cant:.2f} nominales reales")
+        
+    elif opcion == '98':
+        print("\n📝 CARGA DE OPERACIÓN LOCAL (CEDEARs)")
+        ticker = input("Ticker del CEDEAR (Ej: PEP): ").strip().upper()
+        entrada = input("Cantidad operada (usá - para ventas): ").strip().replace(',', '.')
+        try:
+            cantidad = float(entrada)
+        except ValueError:
+            print("❌ Cantidad inválida. Tenés que ingresar números.")
+            continue # Corta acá y vuelve al menú
+            
+        # Si el número está bien, recién acá ejecuta la carga
+        try:
+            cargar_operacion(ticker, cantidad, es_cedear=True)
+        except Exception as e:
+            print(f"❌ Error interno al cargar la operación: {e}")
+            
+    elif opcion == '99':
+        print("\n📝 CARGA DE OPERACIÓN EXTERIOR (ADRs directos)")
+        ticker = input("Ticker del activo (Ej: SPY): ").strip().upper()
+        entrada = input("Cantidad de nominales operados (usá - para ventas): ").strip().replace(',', '.')
+        try:
+            cantidad = float(entrada)
+        except ValueError:
+            print("❌ Cantidad inválida. Tenés que ingresar números.")
+            continue
+            
+        try:
+            cargar_operacion(ticker, cantidad, es_cedear=False)
+        except Exception as e:
+            print(f"❌ Error interno al cargar la operación: {e}")
+
+    elif opcion == '90':
+        print("\n⏳ Empaquetando ecosistema...")
+        exito, msg = exportar_para_gemini(scripts_disponibles)
+        if exito:
+            print(f"✅ ¡Éxito! Se creó el archivo:\n📂 {msg}")
+            print("Arrastralo al chat de Gemini para actualizar el contexto.")
+        else:
+            print(f"❌ Error al exportar: {msg}")
+            
+    elif opcion == '0' or opcion == '':
+        print("\n👋 ¡Cerrando asistente! Buenas inversiones.")
+        break
+        
+    else:
+        print("⚠️ Opción no válida. Intentá de nuevo.")
+
+============================================================
+ 📁 ARCHIVO: credenciales.py
+============================================================
+# credenciales.py
+DNI = '39247476' # Ponelo entre comillas
+BROKER_ID = 284      # El número que te confirme tu asesor
+
+============================================================
+ 📁 ARCHIVO: universo.py
+============================================================
+# ==========================================
+# 🏷️ 2. TU UNIVERSO DE ETIQUETAS
+# ==========================================
+# PEGÁ ACÁ ADENTRO TU DICCIONARIO "universo" COMPLETO DE 100+ TICKERS
+universo = {
+    # ==========================================
+    # 🛒 CONSUMO DEFENSIVO, BEBIDAS Y ALIMENTOS
+    # ==========================================
+    "KO": {"Bebidas", "ConsumoDefensivo", "Dividendos"},
+    "PEP": {"Bebidas", "ConsumoDefensivo", "Dividendos", "Snacks"},
+    "ABEV": {"Bebidas", "ConsumoDefensivo", "Brasil"},
+    "DEO": {"Bebidas", "ConsumoDefensivo", "Europa"},
+    "MDLZ": {"Snacks", "ConsumoDefensivo", "Alimentos"},
+    "PG": {"CuidadoPersonal", "ConsumoDefensivo", "Dividendos"},
+    "UL": {"CuidadoPersonal", "ConsumoDefensivo", "Dividendos"},
+    "CL": {"CuidadoPersonal", "ConsumoDefensivo", "Dividendos"},
+    "WMT": {"Retail", "ConsumoDefensivo", "Supermercados"},
+    "COST": {"Retail", "ConsumoDefensivo", "Supermercados"},
+
+    # ==========================================
+    # 🛍️ CONSUMO DISCRECIONAL Y RETAIL
+    # ==========================================
+    "HD": {"Retail", "ConsumoDiscrecional", "Dividendos", "Construccion"},
+    "LOW": {"Retail", "ConsumoDiscrecional", "Construccion"},
+    "TGT": {"Retail", "ConsumoDiscrecional", "Supermercados"},
+    "NKE": {"Indumentaria", "ConsumoDiscrecional", "Dividendos"},
+    "MCD": {"FastFood", "ConsumoDiscrecional", "Dividendos"},
+    "SBUX": {"FastFood", "ConsumoDiscrecional", "Dividendos"},
+    "ARCO": {"FastFood", "ConsumoDiscrecional", "Latam", "Snacks"},
+
+    # ==========================================
+    # 💻 TECNOLOGÍA, MEGA-CAPS Y SOFTWARE
+    # ==========================================
+    "AAPL": {"Tech", "Hardware", "MegaCap"},
+    "MSFT": {"Tech", "Software", "MegaCap", "IA"},
+    "GOOGL": {"Tech", "Software", "MegaCap", "IA", "Publicidad"},
+    "META": {"Tech", "Software", "MegaCap", "Publicidad", "IA"},
+    "AMZN": {"Tech", "Ecommerce", "MegaCap", "Retail"},
+    "ADBE": {"Tech", "Software"},
+    "SNOW": {"Tech", "Software", "IA"},
+    "PLTR": {"Tech", "Software", "IA"},
+    "IBM": {"Tech", "Software", "Dividendos", "IA", "InfraestructuraIT"},
+    "CSCO": {"Tech", "Hardware", "Redes"},
+    "NOK": {"Tech", "Hardware", "Redes"},
+    "MSI": {"Tech", "Hardware", "Comunicaciones"},
+    "HPQ": {"Tech", "Hardware"},
+    "SONY": {"Tech", "Hardware", "Entretenimiento"},
+    "KEEL": {"MineriaDigital", "Datacenters", "InfraestructuraIT", "HPC", "Blockchain", "Tech"}, # Ex Bitfarms
+
+    # ==========================================
+    # 📦 E-COMMERCE (INTERNACIONAL Y EMERGENTE)
+    # ==========================================
+    "MELI": {"Ecommerce", "Tech", "Latam"},
+    "BABA": {"Ecommerce", "Tech", "China"},
+    "JD": {"Ecommerce", "Tech", "China"},
+    "SHOP": {"Ecommerce", "Tech", "Software"},
+    "EBAY": {"Ecommerce", "Tech"},
+    "SE": {"Ecommerce", "Tech", "Emergentes"},
+    "JMIA": {"Ecommerce", "Tech", "Emergentes"},
+
+    # ==========================================
+    # 📱 STREAMING Y ENTRETENIMIENTO
+    # ==========================================
+    "DIS": {"Entretenimiento", "Streaming", "ConsumoDiscrecional"},
+    "NFLX": {"Entretenimiento", "Streaming", "Tech"},
+    "SPOT": {"Entretenimiento", "Streaming", "Tech"},
+
+    # ==========================================
+    # 🧠 SEMICONDUCTORES (EL CICLO DEL SILICIO)
+    # ==========================================
+    "NVDA": {"Semiconductores", "Tech", "MegaCap", "IA"},
+    "AMD": {"Semiconductores", "Tech", "IA"},
+    "INTC": {"Semiconductores", "Tech"},
+    "TSM": {"Semiconductores", "Tech", "Hardware"},
+    "AVGO": {"Semiconductores", "Tech", "Dividendos"},
+    "QCOM": {"Semiconductores", "Tech"},
+    "MU": {"Semiconductores", "Tech"},
+    "TXN": {"Semiconductores", "Tech", "Dividendos"},
+
+    # ==========================================
+    # 💳 FINANCIERAS, BANCOS Y FINTECH
+    # ==========================================
+    "JPM": {"Financiera", "Bancos", "Dividendos"},
+    "C": {"Financiera", "Bancos", "Dividendos"},
+    "WFC": {"Financiera", "Bancos", "Dividendos"},
+    "GS": {"Financiera", "Bancos", "Inversion"},
+    "V": {"Financiera", "Pagos", "Tech"},
+    "MA": {"Financiera", "Pagos", "Tech"},
+    "AXP": {"Financiera", "Pagos", "Dividendos"},
+    "PYPL": {"Financiera", "Pagos", "Fintech"},
+    "UPST": {"Financiera", "Fintech", "IA"},
+    "BRK-B": {"Financiera", "Conglomerado"},
+
+    # ==========================================
+    # 🌎 LATAM Y BRASIL (FINANZAS Y ENERGÍA)
+    # ==========================================
+    "BBD": {"Financiera", "Bancos", "Brasil"},
+    "ITUB": {"Financiera", "Bancos", "Brasil"},
+    "NU": {"Financiera", "Fintech", "Brasil", "Latam"},
+    "PAGS": {"Financiera", "Pagos", "Fintech", "Brasil"},
+    "STNE": {"Financiera", "Pagos", "Fintech", "Brasil"},
+    "PBR": {"Energia", "Petroleo", "Brasil"},
+    "GPRK": {"Energia", "Petroleo", "Latam"},
+    "VIST": {"Energia", "Petroleo", "Argentina", "Latam"},
+    "AGRO": {"Agro", "Alimentos", "Latam"},
+
+    # ==========================================
+    # 💉 SALUD Y FARMACÉUTICAS
+    # ==========================================
+    "JNJ": {"Farma", "Salud", "Dividendos"},
+    "PFE": {"Farma", "Salud", "Dividendos"},
+    "LLY": {"Farma", "Salud", "Dividendos"},
+    "BMY": {"Farma", "Salud", "Dividendos"},
+    "GILD": {"Farma", "Salud", "Dividendos"},
+    "MRNA": {"Farma", "Salud", "Biotecnologia"},
+    "UNH": {"Salud", "Seguros", "Dividendos"},
+    "ABT": {"Salud", "Farma", "Dividendos"},
+
+    # ==========================================
+    # 🛢️ ENERGÍA Y PETRÓLEO
+    # ==========================================
+    "XOM": {"Energia", "Petroleo", "Dividendos"},
+    "CVX": {"Energia", "Petroleo", "Dividendos"},
+    "OXY": {"Energia", "Petroleo", "Dividendos"},
+    "SHEL": {"Energia", "Petroleo", "Europa", "Dividendos"},
+
+    # ==========================================
+    # 🚜 INDUSTRIA, AUTOMOTRIZ Y AEROESPACIAL
+    # ==========================================
+    "CAT": {"Industrial", "Maquinaria", "Dividendos"},
+    "DE": {"Industrial", "Maquinaria", "Agro"},
+    "GE": {"Industrial", "Conglomerado"},
+    "MMM": {"Industrial", "Conglomerado", "Dividendos"},
+    "F": {"Automotriz", "Industrial", "Dividendos"},
+    "GM": {"Automotriz", "Industrial"},
+    "TM": {"Automotriz", "Industrial", "Asia"},
+    "STLA": {"Automotriz", "Industrial", "Europa"},
+    "TSLA": {"Automotriz", "VehiculosElectricos", "Tech", "ConsumoDiscrecional"},
+    "NIO": {"Automotriz", "VehiculosElectricos", "China", "ConsumoDiscrecional"},
+    "RACE": {"Automotriz", "Lujo", "ConsumoDiscrecional"},
+    "BA": {"Aeroespacial", "Industrial", "Defensa"},
+    "RTX": {"Aeroespacial", "Industrial", "Defensa"},
+    "SPCE": {"Aeroespacial", "Turismo"},
+    "SATL": {"Aeroespacial", "Tech", "Latam"},
+    "AAL": {"Aeroespacial", "Transporte", "ConsumoDiscrecional", "Turismo", "Industrial"}, # American Airlines Group
+
+    # ==========================================
+    # ⛏️ MINERÍA Y MATERIALES
+    # ==========================================
+    "VALE": {"Mineria", "Hierro", "Brasil"},
+    "RIO": {"Mineria", "Hierro", "Dividendos"},
+    "TX": {"Materiales", "Acero", "Latam"},
+    "DOW": {"Materiales", "Quimica", "Dividendos"},
+    "HMY": {"Mineria", "Oro"},
+    "GOLD": {"Mineria", "Oro"},
+    "NEM": {"Mineria", "Oro"},
+    "PAAS": {"Mineria", "Plata"},
+    "LAC": {"Mineria", "Litio", "Materiales"},
+    "BG": {"Agro", "Dividendos"},
+
+    # ==========================================
+    # 📞 TELECOMUNICACIONES
+    # ==========================================
+    "T": {"Telecomunicaciones", "Dividendos"},
+    "VZ": {"Telecomunicaciones", "Dividendos"},
+
+    # ==========================================
+    # 📊 ETFs E ÍNDICES (CRUZAN SOLO ENTRE ELLOS)
+    # ==========================================
+    "SPY": {"ETF", "MercadoUS"},
+    "DIA": {"ETF", "MercadoUS"},
+    "QQQ": {"ETF", "MercadoUS", "Tech"},
+    "IWM": {"ETF", "MercadoUS", "SmallCaps"},
+    "EEM": {"ETF", "Emergentes"},
+    "EWZ": {"ETF", "Brasil"},
+    "ARKK": {"ETF", "Tech", "Innovacion"},
+    "GLD": {"ETF", "Oro"},
+    "COPX": {"ETF", "Cobre", "Mineria"},
+    "XLE": {"ETF", "Energia"},
+    "XLF": {"ETF", "Financiera"},
+    "XME": {"ETF", "Mineria"},
+    
+    # ⚠️ PELIGRO: DERIVADOS Y APALANCADOS
+    "TQQQ": {"ETF", "Derivados", "Tech"},
+    "SH": {"ETF", "Derivados", "MercadoUS"},
+    "VXX": {"ETF", "Derivados", "Volatilidad"}
+}
+# Al final de todo en universo.py
+tickers = list(universo.keys())
+
