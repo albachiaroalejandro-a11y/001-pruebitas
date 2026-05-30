@@ -1,0 +1,74 @@
+[
+    {
+        "t1": "COST",
+        "t2": "AMZN",
+        "ventana": 35,
+        "umbral": 1.5
+    },
+    {
+        "t1": "PEP",
+        "t2": "IBM",
+        "ventana": 40,
+        "umbral": 1.5
+    },
+    {
+        "t1": "PEP",
+        "t2": "ABT",
+        "ventana": 55,
+        "umbral": 1.5
+    },
+    {
+        "t1": "PG",
+        "t2": "CL",
+        "ventana": 50,
+        "umbral": 1.5
+    },
+    {
+        "t1": "PG",
+        "t2": "MDLZ",
+        "ventana": 50,
+        "umbral": 1.5
+    },
+    {
+        "t1": "SE",
+        "t2": "MA",
+        "ventana": 40,
+        "umbral": 1.5
+    },
+    {
+        "t1": "SE",
+        "t2": "SONY",
+        "ventana": 40,
+        "umbral": 1.5
+    },
+    {
+        "t1": "BRK-B",
+        "t2": "V",
+        "ventana": 45,
+        "umbral": 1.5
+    },
+    {
+        "t1": "BRK-B",
+        "t2": "MA",
+        "ventana": 20,
+        "umbral": 1.5
+    },
+    {
+        "t1": "DE",
+        "t2": "STLA",
+        "ventana": 55,
+        "umbral": 1.5
+    },
+    {
+        "t1": "RIO",
+        "t2": "CAT",
+        "ventana": 45,
+        "umbral": 1.5
+    },
+    {
+        "t1": "RIO",
+        "t2": "SHEL",
+        "ventana": 55,
+        "umbral": 1.5
+    }
+]

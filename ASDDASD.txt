@@ -1,0 +1,11 @@
+Proy. Sup P75: $valor  | %Faltante |		
+Proy. Sup. P50: $valor | %Faltante |
+Proy. Sup. P25: $valor | %Faltante |
+
+Sup			$Valor	|$Valor	|$Valor	|$Valor	|
+Temporalidad de caja:	 15m	| 30m 	| 45m	| 60m	|
+Inf			$Valor	|$Valor	|$Valor	|$Valor	|
+
+Proy. Inf. P25: $valor | %Faltante |
+Proy. Inf. P50: $valor | %Faltante |
+Proy. Inf. P75: $valor | %Faltante |
